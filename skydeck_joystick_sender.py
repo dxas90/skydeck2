@@ -13,15 +13,19 @@ CRSF channel mapping (16 channels total; 8 active, remainder parked at mid):
     Ch2  LX  — Left stick X   (Yaw)
     Ch3  RY  — Right stick Y  (Pitch in Mode 2 / Throttle in Mode 1)
     Ch4  RX  — Right stick X  (Roll)
-    Ch5  LB  — Left bumper    (ARM switch — MUST be HIGH to arm the quad)
+    Ch5  LB  — Left bumper    (ARM toggle — press once to arm, press again to disarm)
     Ch6  RB  — Right bumper   (Aux 2 / flight-mode switch)
     Ch7  LT  — Left trigger   (Aux 3)
     Ch8  RT  — Right trigger  (Aux 4)
     Ch9-16   — parked at CRSF mid (991)
 
 IMPORTANT — Ch5 arm logic:
-    LB held   → Ch5 = CRSF_CH_MAX (1811, HIGH) → quad armed
-    LB released → Ch5 = CRSF_CH_MIN (172,  LOW)  → quad disarmed
+    LB is a software toggle, not a hold switch.
+    First press  → armed:   Ch5 = CRSF_CH_MAX (1811, HIGH)
+    Second press → disarmed: Ch5 = CRSF_CH_MIN (172,  LOW)
+    The toggle fires on the rising edge (button-down), so a long press still
+    counts as one toggle event. Log line "Arm toggle: ARMED/DISARMED" is emitted
+    on every state change.
     Configure your FC arming switch on AUX1 (Ch5), arm threshold > ~1700.
 
 CRSF frame structure (26 bytes):
@@ -163,11 +167,17 @@ class GamepadReader:
     Polls the gamepad in a background daemon thread via `inputs.get_gamepad()`.
     The latest normalized channel values are available via read_crsf_channels()
     at any time without blocking.
+
+    Arm toggle (Ch5 / LB):
+        Each press of LB (rising edge only) flips the internal armed flag.
+        The CRSF channel 5 value reflects the flag, not the physical button state,
+        so the pilot can fly freely without holding any button.
     """
 
     def __init__(self) -> None:
         self._lock   = threading.Lock()
         self._state: Dict[str, float] = {}
+        self._armed  = False   # toggle state for Ch5 arm switch
         self._stop   = threading.Event()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="gamepad-reader"
@@ -178,13 +188,20 @@ class GamepadReader:
         self._stop.set()
         self._thread.join(timeout=1.0)
 
+    @property
+    def armed(self) -> bool:
+        with self._lock:
+            return self._armed
+
     def read_crsf_channels(self) -> List[int]:
         """
         Return 16 CRSF channel values reflecting the current gamepad state.
         Channels 1-8 are mapped from the gamepad; 9-16 are parked at mid.
+        Ch5 reflects the latched arm toggle, not the raw LB button state.
         """
         with self._lock:
-            s = self._state.copy()
+            s      = self._state.copy()
+            armed  = self._armed
 
         lx  = s.get("ABS_X",  0.0)
         ly  = -s.get("ABS_Y", 0.0)   # Y is inverted on most gamepads
@@ -192,18 +209,17 @@ class GamepadReader:
         ry  = -s.get("ABS_RY", 0.0)
         lt  = s.get("ABS_Z",  0.0)
         rt  = s.get("ABS_RZ", 0.0)
-        lb  = float(s.get("BTN_TL", 0))
         rb  = float(s.get("BTN_TR", 0))
 
         active = [
-            axis_to_crsf(ly),      # Ch1  LY  — Throttle/Pitch
-            axis_to_crsf(lx),      # Ch2  LX  — Yaw
-            axis_to_crsf(ry),      # Ch3  RY  — Pitch/Throttle
-            axis_to_crsf(rx),      # Ch4  RX  — Roll
-            button_to_crsf(lb),    # Ch5  LB  — ARM (high = armed, low = disarmed)
-            button_to_crsf(rb),    # Ch6  RB  — Aux 2 / flight mode
-            trigger_to_crsf(lt),   # Ch7  LT  — Aux 3
-            trigger_to_crsf(rt),   # Ch8  RT  — Aux 4
+            axis_to_crsf(ly),                  # Ch1  LY  — Throttle/Pitch
+            axis_to_crsf(lx),                  # Ch2  LX  — Yaw
+            axis_to_crsf(ry),                  # Ch3  RY  — Pitch/Throttle
+            axis_to_crsf(rx),                  # Ch4  RX  — Roll
+            CRSF_CH_MAX if armed else CRSF_CH_MIN,  # Ch5  ARM toggle (LB press)
+            button_to_crsf(rb),                # Ch6  RB  — Aux 2 / flight mode
+            trigger_to_crsf(lt),               # Ch7  LT  — Aux 3
+            trigger_to_crsf(rt),               # Ch8  RT  — Aux 4
         ]
         return active + [CRSF_CH_MID] * (CHAN_COUNT - ACTIVE_CHANS)
 
@@ -228,13 +244,20 @@ class GamepadReader:
             "ABS_RY": self._norm_axis,
             "ABS_Z":  self._norm_trigger,
             "ABS_RZ": self._norm_trigger,
-            "BTN_TL": lambda v: float(v),
+            # BTN_TL (LB) handled separately as a toggle — not stored in _state
             "BTN_TR": lambda v: float(v),
         }
         while not self._stop.is_set():
             try:
                 for event in get_gamepad():
-                    if event.code in normalizers:
+                    # Rising edge of LB → flip arm toggle
+                    if event.code == "BTN_TL" and event.state == 1:
+                        with self._lock:
+                            self._armed = not self._armed
+                        logging.info(
+                            "Arm toggle: %s", "ARMED" if self._armed else "DISARMED"
+                        )
+                    elif event.code in normalizers:
                         val = normalizers[event.code](event.state)
                         with self._lock:
                             self._state[event.code] = val
