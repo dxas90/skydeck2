@@ -140,7 +140,7 @@ wait_for_port() {
     log "Using specified port: $PORT"
     return
   fi
-  log "Waiting for /dev/ttyACM* (plug in the ExpressLRS TX module)..."
+  log "Waiting for /dev/ttyACM* (plug in the ExpressLRS module)..."
   while true; do
     local devs
     mapfile -t devs < <(compgen -G '/dev/ttyACM*' || true)

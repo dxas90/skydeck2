@@ -1,8 +1,9 @@
 # SkyDeck GCU
 
 **SkyDeck** turns a Steam Deck into a self-contained FPV Ground Control Unit:
-ExpressLRS RC link, CRSF channel encoding on an ESP32-S2 bridge, and
-low-latency live video via the OpenIPC Aviateur AppImage — all in one device.
+the Python script sends CRSF frames **directly** to an ExpressLRS TX module
+over USB, and Aviateur provides low-latency live video via an RTL8812AU WiFi
+adapter — no intermediate microcontroller needed.
 
 ---
 
@@ -11,12 +12,8 @@ low-latency live video via the OpenIPC Aviateur AppImage — all in one device.
 | Part | Purpose |
 |------|---------|
 | Steam Deck | Host computer + display + controller |
-| Happymodel ES24TX (or any ExpressLRS nano TX) | RC transmitter module |
-| ESP32-S2 Mini | USB-CDC to CRSF bridge |
+| ExpressLRS TX module (e.g. Happymodel ES24TX, BetaFPV ELRS Nano) | RC transmitter — receives CRSF over USB |
 | RTL8812AU USB WiFi adapter | Aviateur video RX (OpenIPC WFB-NG link) |
-
-3D-printable backpack / mount CAD:
-https://cad.onshape.com/documents/0a85f5b80c6099a2fc1cf05d/w/0408ca52d32ec3c9c9f8f564/e/62ef1ad992c53a1e1d5da3ef
 
 ---
 
@@ -26,10 +23,8 @@ https://cad.onshape.com/documents/0a85f5b80c6099a2fc1cf05d/w/0408ca52d32ec3c9c9f
 Steam Deck
   inputs (evdev)
       |
-  skydeck_joystick_sender.py   (100 Hz, uv venv)
-      |  USB-CDC ASCII packets
-  ESP32-S2
-      |  CRSF @ 400 kbaud UART
+  skydeck_joystick_sender.py   (uv venv, 150 Hz)
+      |  CRSF binary frames @ 400 000 baud  (USB-CDC)
   ExpressLRS TX module
       |  915 / 2.4 GHz RF
   Drone FC (ELRS RX)
@@ -61,31 +56,26 @@ chmod +x install.sh deck.sh
 - Install the RTL8812AU udev rule (`/etc/udev/rules.d/80-my8812au.rules`)
 - Install the `.desktop` launcher for KDE / Steam
 
-### 2. Flash the ESP32-S2
-
-Open `skydeck_esp32/skydeck_esp32.ino` in the Arduino IDE (or PlatformIO)
-with the ESP32 Arduino core installed, select your board, and flash.
-
-### 3. Run
+### 2. Run
 
 ```bash
-# From the project directory:
+# Auto-detect the ELRS module port:
 ./deck.sh
 
-# Or specify a port explicitly:
+# Specify port explicitly:
 ./deck.sh /dev/ttyACM0
 
-# With live log output:
+# With live log output on screen:
 ./deck.sh --log
 ```
 
 `deck.sh` will:
 1. Rebind the Steam Deck controller from `hid_steam` to `hid_generic`
-2. Wait for the ESP32 serial device to appear
+2. Wait for the ELRS USB-CDC device to appear (`/dev/ttyACM*`)
 3. Activate the `skydeck_env` virtual environment
-4. Launch `skydeck_joystick_sender.py` with auto-restart
+4. Launch `skydeck_joystick_sender.py` with auto-restart on crash
 
-### 4. Launch Aviateur (FPV video)
+### 3. Launch Aviateur (FPV video)
 
 ```bash
 ./aviateur.AppImage
@@ -104,28 +94,34 @@ Or launch it from the KDE application menu / Steam as a Non-Steam Game.
 
 ---
 
-## Serial Packet Format
+## CRSF Frame Format
+
+The sender transmits standard 26-byte CRSF RC_CHANNELS_PACKED frames at
+150 Hz directly understood by every ExpressLRS module:
 
 ```
-"LY LX RY RX LT RT LB RB :"
+Byte  0     0xEE  — destination (CRSF_ADDRESS_MODULE)
+Byte  1     0x18  — payload length (24)
+Byte  2     0x16  — frame type RC_CHANNELS_PACKED
+Bytes 3-24        — 16 × 11-bit channel values, LSB-first packed
+Byte  25          — CRC-8/DVB-S2 of bytes [2..24]
 ```
 
-Each channel is a zero-padded 3-digit decimal in the range `[000 .. 800]`,
-followed by `:` as the frame delimiter. Total: 25 bytes per packet @ 100 Hz.
+### Channel mapping
 
-| Channel | Input | Range | Description |
-|---------|-------|-------|-------------|
-| 1 (LY) | Left stick Y | 0-800 | Throttle / Pitch |
-| 2 (LX) | Left stick X | 0-800 | Yaw |
-| 3 (RY) | Right stick Y | 0-800 | Pitch / Throttle |
-| 4 (RX) | Right stick X | 0-800 | Roll |
-| 5 (LT) | Left trigger | 0-800 | Aux |
-| 6 (RT) | Right trigger | 0-800 | Aux |
-| 7 (LB) | Left bumper | 0 / 800 | Arm / Mode |
-| 8 (RB) | Right bumper | 0 / 800 | Aux |
+| Ch | Input | Description |
+|----|-------|-------------|
+| 1  | Left stick Y  | Throttle (Mode 2) / Pitch (Mode 1) |
+| 2  | Left stick X  | Yaw |
+| 3  | Right stick Y | Pitch (Mode 2) / Throttle (Mode 1) |
+| 4  | Right stick X | Roll |
+| 5  | Left trigger  | Aux 1 |
+| 6  | Right trigger | Aux 2 |
+| 7  | Left bumper   | Arm / flight-mode switch |
+| 8  | Right bumper  | Aux 4 |
+| 9-16 | — | Parked at CRSF mid (991) |
 
-The ESP32 maps each value from `[0..800]` to CRSF range `[172..1811]` and packs
-all 16 channels into a standard CRSF RC-channels frame transmitted at 500 Hz.
+All active channels map to CRSF range **172 (min) … 991 (mid) … 1811 (max)**.
 
 ---
 
@@ -136,9 +132,7 @@ skydeck2/
   install.sh                    # one-time setup script
   deck.sh                       # runtime launcher
   skydeck.desktop               # KDE / Steam desktop entry
-  skydeck_joystick_sender.py    # Python host sender
-  skydeck_esp32/
-    skydeck_esp32.ino           # ESP32-S2 firmware (Arduino)
+  skydeck_joystick_sender.py    # Python CRSF sender
   skydeck_env/                  # uv venv (created by install.sh, not tracked)
   aviateur.AppImage             # downloaded by install.sh, not tracked
   deck.log                      # runtime log (not tracked)
