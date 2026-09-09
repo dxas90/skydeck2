@@ -2,186 +2,86 @@
 """
 skydeck_joystick_sender.py
 
-Reads the Steam Deck (or any gamepad) via the `inputs` library and sends
-binary CRSF RC-channel frames directly to an ExpressLRS TX module connected
-over USB (the module's USB-CDC / Backpack serial port).
+Reads the Steam Deck (or any Linux gamepad) via the `inputs` library and
+sends binary CRSF RC_CHANNELS_PACKED frames directly to an ExpressLRS TX
+module connected over USB-CDC at 400 000 baud.
 
-No ESP32 bridge is needed — the ELRS module accepts CRSF natively at 400 000 baud.
+No ESP32 bridge needed — every ELRS module accepts CRSF natively.
 
-CRSF channel mapping (16 channels total; 8 active, remainder parked at mid):
-    Ch1  LY  — Left stick Y   (Throttle in Mode 2 / Pitch in Mode 1)
-    Ch2  LX  — Left stick X   (Yaw)
-    Ch3  RY  — Right stick Y  (Pitch in Mode 2 / Throttle in Mode 1)
-    Ch4  RX  — Right stick X  (Roll)
-    Ch5  LB  — Left bumper    (ARM toggle — press once to arm, press again to disarm)
-    Ch6  RB  — Right bumper   (Aux 2 / flight-mode switch)
-    Ch7  LT  — Left trigger   (Aux 3)
-    Ch8  RT  — Right trigger  (Aux 4)
-    Ch9-16   — parked at CRSF mid (991)
+Channel mapping (16 total; 8 active, remainder parked at CRSF mid):
+    Ch1  Left stick Y  — Throttle (Mode 2) / Pitch (Mode 1)
+    Ch2  Left stick X  — Yaw
+    Ch3  Right stick Y — Pitch (Mode 2) / Throttle (Mode 1)
+    Ch4  Right stick X — Roll
+    Ch5  LB (toggle)   — ARM: press once to arm, press again to disarm
+    Ch6  RB            — Aux 2 / flight-mode switch
+    Ch7  Left trigger  — Aux 3
+    Ch8  Right trigger — Aux 4
+    Ch9-16             — parked at CRSF_CH_MID (991)
 
-IMPORTANT — Ch5 arm logic:
-    LB is a software toggle, not a hold switch.
-    First press  → armed:   Ch5 = CRSF_CH_MAX (1811, HIGH)
-    Second press → disarmed: Ch5 = CRSF_CH_MIN (172,  LOW)
-    The toggle fires on the rising edge (button-down), so a long press still
-    counts as one toggle event. Log line "Arm toggle: ARMED/DISARMED" is emitted
-    on every state change.
-    Configure your FC arming switch on AUX1 (Ch5), arm threshold > ~1700.
-
-CRSF frame structure (26 bytes):
-    [0]     0xEE  destination address (CRSF_ADDRESS_MODULE)
-    [1]     0x18  payload length = 24 (type + 22 packed channel bytes + CRC)
-    [2]     0x16  frame type RC_CHANNELS_PACKED
-    [3-24]  16 × 11-bit channel values, LSB-first, packed across byte boundaries
-    [25]    CRC-8/DVB-S2 over bytes [2..24]
+Arm toggle (Ch5):
+    Fires on the rising edge of LB (button-down only).
+    Armed   → Ch5 = CRSF_CH_MAX (1811)
+    Disarmed → Ch5 = CRSF_CH_MIN (172)
+    FC setup: map AUX1 (Ch5) as arm switch, threshold > ~1700.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
-import sys
 import threading
 import time
-from contextlib import contextmanager
-from typing import Dict, List
 
-import serial
 from inputs import UnpluggedError, get_gamepad
 
+from crsf import (
+    CHAN_COUNT,
+    CRSF_BAUD,
+    CRSF_CH_MAX,
+    CRSF_CH_MID,
+    CRSF_CH_MIN,
+    axis_to_crsf,
+    build_crsf_frame,
+    button_to_crsf,
+    find_elrs_port,
+    open_serial,
+    trigger_to_crsf,
+)
+
 # ---------------------------------------------------------------------------
-# Constants
+# Gamepad normalisation constants
 # ---------------------------------------------------------------------------
-CRSF_BAUD    = 400_000   # ExpressLRS native CRSF baud rate
-DEFAULT_HZ   = 150       # packet send rate — ELRS handles up to 500 Hz;
-                          # 150 Hz is plenty and keeps USB overhead low
-CHAN_COUNT    = 16        # total CRSF channels in one frame
+MAX_JOY_VAL = 32_767.0  # raw axis maximum from inputs library
+MAX_TRIG_VAL = 255.0  # raw trigger maximum
+DEADZONE = 0.05  # fraction of full-scale treated as centre
 
-# Active channel count (remainder parked at mid)
-ACTIVE_CHANS  = 8
-
-# CRSF channel value range
-CRSF_CH_MIN   = 172
-CRSF_CH_MID   = 991
-CRSF_CH_MAX   = 1811
-
-# CRSF frame constants
-CRSF_ADDR_MODULE    = 0xEE
-CRSF_TYPE_CHANNELS  = 0x16
-CRSF_FRAME_SIZE     = 26   # total bytes on the wire
-
-# Gamepad normalisation
-MAX_JOY_VAL  = 32_767.0   # raw axis maximum from inputs library
-MAX_TRIG_VAL = 255.0       # raw trigger maximum
-DEADZONE     = 0.05        # fraction of full-scale treated as zero
+DEFAULT_HZ = 150  # send rate — ELRS handles up to 500 Hz
+ACTIVE_CHANS = 8
 
 
 # ---------------------------------------------------------------------------
-# CRC-8/DVB-S2
+# Gamepad reader — background thread
 # ---------------------------------------------------------------------------
 
-def _build_crc8_table() -> bytes:
-    table = []
-    for i in range(256):
-        crc = i
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0xD5) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-        table.append(crc)
-    return bytes(table)
-
-_CRC8_TABLE = _build_crc8_table()
-
-
-def crc8_dvb_s2(data: bytes) -> int:
-    """Compute CRC-8/DVB-S2 over data."""
-    crc = 0
-    for byte in data:
-        crc = _CRC8_TABLE[crc ^ byte]
-    return crc
-
-
-# ---------------------------------------------------------------------------
-# CRSF channel value helpers
-# ---------------------------------------------------------------------------
-
-def norm_to_crsf(norm: float) -> int:
-    """Map a normalized value [0.0 .. 1.0] to CRSF range [172 .. 1811]."""
-    return int(CRSF_CH_MIN + norm * (CRSF_CH_MAX - CRSF_CH_MIN))
-
-
-def axis_to_crsf(v: float) -> int:
-    """Map a normalized axis [-1.0 .. +1.0] to CRSF range [172 .. 1811]."""
-    return norm_to_crsf((v + 1.0) / 2.0)
-
-
-def trigger_to_crsf(v: float) -> int:
-    """Map a normalized trigger [0.0 .. 1.0] to CRSF range [172 .. 1811]."""
-    return norm_to_crsf(v)
-
-
-def button_to_crsf(v: float) -> int:
-    """Map a button (0 or 1) to CRSF low / high."""
-    return CRSF_CH_MAX if v else CRSF_CH_MIN
-
-
-# ---------------------------------------------------------------------------
-# CRSF frame builder
-# ---------------------------------------------------------------------------
-
-def build_crsf_frame(channels: List[int]) -> bytes:
-    """
-    Pack up to 16 CRSF channel values (integers in [172..1811]) into a
-    26-byte CRSF RC_CHANNELS_PACKED frame ready to write to serial.
-
-    Channels shorter than 16 are padded with CRSF_CH_MID.
-    """
-    # Pad / truncate to exactly 16 channels
-    ch = list(channels[:CHAN_COUNT])
-    ch += [CRSF_CH_MID] * (CHAN_COUNT - len(ch))
-
-    # Pack 16 × 11-bit values, LSB-first, into 22 bytes
-    bits = 0
-    bit_count = 0
-    packed = bytearray()
-    for val in ch:
-        bits |= (val & 0x7FF) << bit_count
-        bit_count += 11
-        while bit_count >= 8:
-            packed.append(bits & 0xFF)
-            bits >>= 8
-            bit_count -= 8
-
-    # Frame: addr | length | type | 22-byte packed channels | CRC
-    # length field = bytes after itself = type(1) + packed(22) + crc(1) = 24
-    payload = bytes([CRSF_TYPE_CHANNELS]) + bytes(packed)  # 23 bytes (type + packed)
-    crc = crc8_dvb_s2(payload)
-    frame = bytes([CRSF_ADDR_MODULE, len(payload) + 1]) + payload + bytes([crc])
-    assert len(frame) == CRSF_FRAME_SIZE, f"Unexpected frame size: {len(frame)}"
-    return frame
-
-
-# ---------------------------------------------------------------------------
-# Gamepad reader (background thread)
-# ---------------------------------------------------------------------------
 
 class GamepadReader:
     """
-    Polls the gamepad in a background daemon thread via `inputs.get_gamepad()`.
-    The latest normalized channel values are available via read_crsf_channels()
-    at any time without blocking.
+    Polls the gamepad in a daemon thread via `inputs.get_gamepad()`.
+    The latest normalised channel values are always available via
+    read_crsf_channels() without blocking the send loop.
 
     Arm toggle (Ch5 / LB):
-        Each press of LB (rising edge only) flips the internal armed flag.
-        The CRSF channel 5 value reflects the flag, not the physical button state,
-        so the pilot can fly freely without holding any button.
+        Rising edge of LB flips the internal armed flag.
+        Ch5 reflects the flag — not the physical button state.
     """
 
     def __init__(self) -> None:
-        self._lock   = threading.Lock()
-        self._state: Dict[str, float] = {}
-        self._armed  = False   # toggle state for Ch5 arm switch
-        self._stop   = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="gamepad-reader"
-        )
+        self._lock = threading.Lock()
+        self._state: dict[str, float] = {}
+        self._armed = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="gamepad-reader")
         self._thread.start()
 
     def stop(self) -> None:
@@ -193,33 +93,29 @@ class GamepadReader:
         with self._lock:
             return self._armed
 
-    def read_crsf_channels(self) -> List[int]:
-        """
-        Return 16 CRSF channel values reflecting the current gamepad state.
-        Channels 1-8 are mapped from the gamepad; 9-16 are parked at mid.
-        Ch5 reflects the latched arm toggle, not the raw LB button state.
-        """
+    def read_crsf_channels(self) -> list[int]:
+        """Return 16 CRSF channel integers for the current gamepad state."""
         with self._lock:
-            s      = self._state.copy()
-            armed  = self._armed
+            s = self._state.copy()
+            armed = self._armed
 
-        lx  = s.get("ABS_X",  0.0)
-        ly  = -s.get("ABS_Y", 0.0)   # Y is inverted on most gamepads
-        rx  = s.get("ABS_RX", 0.0)
-        ry  = -s.get("ABS_RY", 0.0)
-        lt  = s.get("ABS_Z",  0.0)
-        rt  = s.get("ABS_RZ", 0.0)
-        rb  = float(s.get("BTN_TR", 0))
+        lx = s.get("ABS_X", 0.0)
+        ly = -s.get("ABS_Y", 0.0)  # Y axis is inverted on most gamepads
+        rx = s.get("ABS_RX", 0.0)
+        ry = -s.get("ABS_RY", 0.0)
+        lt = s.get("ABS_Z", 0.0)
+        rt = s.get("ABS_RZ", 0.0)
+        rb = float(s.get("BTN_TR", 0))
 
-        active = [
-            axis_to_crsf(ly),                  # Ch1  LY  — Throttle/Pitch
-            axis_to_crsf(lx),                  # Ch2  LX  — Yaw
-            axis_to_crsf(ry),                  # Ch3  RY  — Pitch/Throttle
-            axis_to_crsf(rx),                  # Ch4  RX  — Roll
-            CRSF_CH_MAX if armed else CRSF_CH_MIN,  # Ch5  ARM toggle (LB press)
-            button_to_crsf(rb),                # Ch6  RB  — Aux 2 / flight mode
-            trigger_to_crsf(lt),               # Ch7  LT  — Aux 3
-            trigger_to_crsf(rt),               # Ch8  RT  — Aux 4
+        active: list[int] = [
+            axis_to_crsf(ly),  # Ch1  LY
+            axis_to_crsf(lx),  # Ch2  LX
+            axis_to_crsf(ry),  # Ch3  RY
+            axis_to_crsf(rx),  # Ch4  RX
+            CRSF_CH_MAX if armed else CRSF_CH_MIN,  # Ch5  ARM toggle
+            button_to_crsf(rb),  # Ch6  RB
+            trigger_to_crsf(lt),  # Ch7  LT
+            trigger_to_crsf(rt),  # Ch8  RT
         ]
         return active + [CRSF_CH_MID] * (CHAN_COUNT - ACTIVE_CHANS)
 
@@ -238,24 +134,24 @@ class GamepadReader:
 
     def _run(self) -> None:
         normalizers = {
-            "ABS_X":  self._norm_axis,
-            "ABS_Y":  self._norm_axis,
+            "ABS_X": self._norm_axis,
+            "ABS_Y": self._norm_axis,
             "ABS_RX": self._norm_axis,
             "ABS_RY": self._norm_axis,
-            "ABS_Z":  self._norm_trigger,
+            "ABS_Z": self._norm_trigger,
             "ABS_RZ": self._norm_trigger,
-            # BTN_TL (LB) handled separately as a toggle — not stored in _state
-            "BTN_TR": lambda v: float(v),
+            # BTN_TL (LB) is handled as a toggle — not stored in _state
+            "BTN_TR": float,
         }
         while not self._stop.is_set():
             try:
                 for event in get_gamepad():
-                    # Rising edge of LB → flip arm toggle
                     if event.code == "BTN_TL" and event.state == 1:
                         with self._lock:
                             self._armed = not self._armed
                         logging.info(
-                            "Arm toggle: %s", "ARMED" if self._armed else "DISARMED"
+                            "Arm toggle: %s",
+                            "ARMED" if self._armed else "DISARMED",
                         )
                     elif event.code in normalizers:
                         val = normalizers[event.code](event.state)
@@ -270,59 +166,38 @@ class GamepadReader:
 
 
 # ---------------------------------------------------------------------------
-# Serial helpers
-# ---------------------------------------------------------------------------
-
-@contextmanager
-def open_serial(port: str, baud: int):
-    """Context manager: open serial port, yield it, close on exit."""
-    ser = serial.Serial(port, baud, timeout=1)
-    try:
-        yield ser
-    finally:
-        ser.close()
-
-
-def auto_find_port(baud: int) -> str:
-    """Probe common USB-CDC device nodes and return the first that opens."""
-    candidates = [f"/dev/ttyACM{i}" for i in range(4)]
-    for path in candidates:
-        try:
-            with serial.Serial(path, baud, timeout=0.1):
-                logging.info("Auto-detected ELRS module on: %s", path)
-                return path
-        except Exception:
-            continue
-    logging.error(
-        "ExpressLRS module not found on %s — plug it in and try again.",
-        ", ".join(candidates),
-    )
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SkyDeck: send gamepad input as CRSF directly to an ExpressLRS TX module",
+        description="SkyDeck: stream gamepad input as CRSF to an ExpressLRS TX module",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-p", "--port",
+        "-p",
+        "--port",
         help="Serial port of the ELRS module, e.g. /dev/ttyACM0 (auto-detected if omitted)",
     )
     parser.add_argument(
-        "-b", "--baud", type=int, default=CRSF_BAUD,
-        help="Serial baud rate (must match ELRS Backpack CRSF baud)",
+        "-b",
+        "--baud",
+        type=int,
+        default=CRSF_BAUD,
+        help="Serial baud rate",
     )
     parser.add_argument(
-        "-r", "--rate", type=int, default=DEFAULT_HZ,
+        "-r",
+        "--rate",
+        type=int,
+        default=DEFAULT_HZ,
         help="CRSF frame send rate in Hz",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v",
+        "--verbose",
+        action="store_true",
         help="Enable DEBUG logging",
     )
     args = parser.parse_args()
@@ -333,7 +208,7 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    port     = args.port or auto_find_port(args.baud)
+    port = args.port or find_elrs_port(args.baud)
     interval = 1.0 / args.rate
 
     logging.info("Opening ELRS module on %s @ %d baud", port, args.baud)
@@ -341,20 +216,20 @@ def main() -> None:
 
     try:
         with open_serial(port, args.baud) as ser:
-            logging.info("Sending CRSF frames at %d Hz — Ctrl-C to stop", args.rate)
+            logging.info("Sending CRSF at %d Hz — Ctrl-C to stop", args.rate)
             while True:
-                t0    = time.monotonic()
+                t0 = time.monotonic()
                 frame = build_crsf_frame(gamepad.read_crsf_channels())
                 ser.write(frame)
                 elapsed = time.monotonic() - t0
-                remaining = interval - elapsed
-                if remaining > 0:
-                    time.sleep(remaining)
+                slack = interval - elapsed
+                if slack > 0:
+                    time.sleep(slack)
     except KeyboardInterrupt:
         logging.info("Stopped by user (Ctrl-C)")
-    except serial.SerialException as exc:
-        logging.error("Serial error: %s", exc)
-        sys.exit(1)
+    except Exception as exc:
+        logging.error("Fatal error: %s", exc)
+        raise
     finally:
         gamepad.stop()
 

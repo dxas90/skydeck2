@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"   # triggers on v0.1.0, v1.2.3, etc.
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Create virtual environment
+        run: uv venv .venv
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]"
+
+      - name: Run tests (gate before release)
+        run: .venv/bin/python -m pytest tests/ -v --tb=short
+
+      # -----------------------------------------------------------------------
+      # Bundle the project into a self-contained zip for the release assets.
+      # Users on the Steam Deck can download, unzip, and run install.sh.
+      # -----------------------------------------------------------------------
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release archive
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          ARCHIVE="skydeck-${VERSION}.tar.gz"
+          tar -czf "$ARCHIVE" \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='skydeck_env' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='deck.log' \
+            --exclude='aviateur.AppImage' \
+            .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+        id: archive
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       "SkyDeck ${{ steps.version.outputs.VERSION }}"
+          draft:      false
+          prerelease: ${{ contains(github.ref_name, '-') }}   # v1.0.0-rc.1 → pre-release
+          body: |
+            ## SkyDeck ${{ steps.version.outputs.VERSION }}
+
+            ### Install
+            ```bash
+            tar -xzf skydeck-${{ steps.version.outputs.VERSION }}.tar.gz
+            cd skydeck-${{ steps.version.outputs.VERSION }}
+            chmod +x install.sh deck.sh
+            ./install.sh
+            ```
+
+            ### What's included
+            - `crsf.py` — shared CRSF protocol library
+            - `skydeck_joystick_sender.py` — gamepad → CRSF sender
+            - `elrs_config.py` — interactive ELRS configurator TUI
+            - `install.sh` — one-shot setup (venv, Aviateur, udev, desktop entry)
+            - `deck.sh` — runtime launcher
+
+            See `README.md` for full documentation.
+          files: |
+            ${{ steps.archive.outputs.ARCHIVE }}
+            ${{ steps.archive.outputs.ARCHIVE }}.sha256
