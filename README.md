@@ -159,6 +159,24 @@ skydeck2/
 
 ---
 
+## Acknowledgements
+
+SkyDeck builds on the work of these projects and people:
+
+**Original SkyDeck authors**
+- [rockcutto](https://github.com/rockcutto) — original concept, ESP32 firmware, deck launcher scripts
+- [Tigris](https://github.com/tigeysky) — early Python sender and deck integration work
+- [Steam Deck User](https://github.com/dxas90/skydeck2/commits) — initial hardware bring-up commits
+
+**Upstream projects**
+- [OpenIPC / Aviateur](https://github.com/OpenIPC/aviateur) — low-latency FPV video ground station (AppImage)
+- [ExpressLRS](https://github.com/ExpressLRS/ExpressLRS) — open-source RC link protocol and TX module firmware; CRSF parameter protocol (`elrs.lua`)
+- [pyserial](https://github.com/pyserial/pyserial) — Python serial port library
+- [inputs](https://github.com/zeth/inputs) — cross-platform gamepad / evdev reading for Python
+- [uv](https://github.com/astral-sh/uv) — fast Python package and virtual environment manager
+
+---
+
 ## License
 
 MIT
