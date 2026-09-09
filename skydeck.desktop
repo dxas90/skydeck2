@@ -1,9 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=SkyDeck Joystick Sender
-Comment=Автозапуск Python-скрипта deck.sh для передачи CRSF на ESP32
-Exec=bash -c "cd /home/deck/SkyDeck && ./deck.sh"
+Name=SkyDeck GCU
+Comment=FPV Ground Control Unit — joystick sender + Aviateur video feed
+Exec=bash -c "cd /home/deck/SkyDeck && ./deck.sh --log"
 Path=/home/deck/SkyDeck
 Terminal=true
+Icon=/home/deck/SkyDeck/skydeck_icon.png
 X-KDE-AutostartNotify=false
 OnlyShowIn=KDE;
+Categories=Game;
