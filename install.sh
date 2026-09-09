@@ -78,7 +78,9 @@ import json, sys
 data = json.load(sys.stdin)
 assets = data.get('assets', [])
 for a in assets:
-    if 'linux' in a['name'].lower() and a['name'].endswith('.AppImage'):
+    name = a['name']
+    # Match e.g. Aviateur_0.3.3_linux_x86_64.AppImage
+    if name.endswith('.AppImage') and 'linux' in name.lower() and 'x86_64' in name:
         print(a['browser_download_url'])
         break
 " 2>/dev/null
