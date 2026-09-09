@@ -23,6 +23,7 @@ cd "$SCRIPT_DIR"
 VENV_DIR="$SCRIPT_DIR/skydeck_env"
 AVIATEUR_APPIMAGE="$SCRIPT_DIR/aviateur.AppImage"
 UDEV_RULES_FILE="/etc/udev/rules.d/80-my8812au.rules"
+UDEV_RULES_BACKUP="$HOME/.config/skydeck/80-my8812au.rules"   # survives SteamOS updates
 UDEV_RULES_URL="https://raw.githubusercontent.com/OpenIPC/aviateur/refs/heads/main/80-my8812au.rules"
 AVIATEUR_API="https://api.github.com/repos/OpenIPC/aviateur/releases/latest"
 
@@ -98,6 +99,13 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Install udev rules for RTL8812AU (Aviateur WiFi adapter)
+#
+# SteamOS is an immutable OS — /etc is wiped on system updates.
+# Strategy:
+#   a) Save the rules file to ~/.config/skydeck/ (survives updates)
+#   b) Copy it to /etc/udev/rules.d/ now (active immediately)
+#   c) Install a systemd user service that re-applies the rules on every boot
+#      so they are restored automatically after a SteamOS update.
 # ---------------------------------------------------------------------------
 log "Installing udev rules for RTL8812AU adapter..."
 
@@ -106,14 +114,59 @@ if [[ -z "$RULES_CONTENT" ]]; then
   die "Failed to download udev rules from $UDEV_RULES_URL"
 fi
 
+# (a) Persist a copy in home directory
+mkdir -p "$(dirname "$UDEV_RULES_BACKUP")"
+echo "$RULES_CONTENT" > "$UDEV_RULES_BACKUP"
+log "Backup saved: $UDEV_RULES_BACKUP"
+
+# (b) Install to /etc/udev/rules.d/ now
 if [[ -f "$UDEV_RULES_FILE" ]] && [[ "$(cat "$UDEV_RULES_FILE")" == "$RULES_CONTENT" ]]; then
-  log "udev rules already up to date — skipping."
+  log "udev rules already up to date — skipping /etc write."
 else
   echo "$RULES_CONTENT" | sudo tee "$UDEV_RULES_FILE" > /dev/null
   sudo udevadm control --reload-rules
   sudo udevadm trigger
   log "udev rules installed and reloaded: $UDEV_RULES_FILE"
 fi
+
+# (c) Systemd user service to re-apply rules after each SteamOS update/boot
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+RESTORE_SERVICE="$SYSTEMD_USER_DIR/skydeck-udev-restore.service"
+mkdir -p "$SYSTEMD_USER_DIR"
+cat > "$RESTORE_SERVICE" <<SERVICE
+[Unit]
+Description=Restore SkyDeck udev rules after SteamOS update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'cp %h/.config/skydeck/80-my8812au.rules /etc/udev/rules.d/80-my8812au.rules && udevadm control --reload-rules && udevadm trigger'
+# Note: requires sudo NOPASSWD for udevadm, or run as root via system service
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+# Also install as a system service (runs as root, reliable for udev)
+SYSTEM_SERVICE="/etc/systemd/system/skydeck-udev-restore.service"
+sudo tee "$SYSTEM_SERVICE" > /dev/null <<SSERVICE
+[Unit]
+Description=Restore SkyDeck udev rules after SteamOS update
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'cp /home/deck/.config/skydeck/80-my8812au.rules /etc/udev/rules.d/80-my8812au.rules && udevadm control --reload-rules && udevadm trigger'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SSERVICE
+
+sudo systemctl daemon-reload
+sudo systemctl enable skydeck-udev-restore.service
+log "Systemd service installed: rules will be restored after every SteamOS update."
 
 # ---------------------------------------------------------------------------
 # Step 5: Install .desktop file for Steam / KDE application launcher
