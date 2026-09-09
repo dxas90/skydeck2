@@ -13,11 +13,16 @@ CRSF channel mapping (16 channels total; 8 active, remainder parked at mid):
     Ch2  LX  — Left stick X   (Yaw)
     Ch3  RY  — Right stick Y  (Pitch in Mode 2 / Throttle in Mode 1)
     Ch4  RX  — Right stick X  (Roll)
-    Ch5  LT  — Left trigger   (Aux 1)
-    Ch6  RT  — Right trigger  (Aux 2)
-    Ch7  LB  — Left bumper    (Arm / flight-mode switch)
-    Ch8  RB  — Right bumper   (Aux 4)
+    Ch5  LB  — Left bumper    (ARM switch — MUST be HIGH to arm the quad)
+    Ch6  RB  — Right bumper   (Aux 2 / flight-mode switch)
+    Ch7  LT  — Left trigger   (Aux 3)
+    Ch8  RT  — Right trigger  (Aux 4)
     Ch9-16   — parked at CRSF mid (991)
+
+IMPORTANT — Ch5 arm logic:
+    LB held   → Ch5 = CRSF_CH_MAX (1811, HIGH) → quad armed
+    LB released → Ch5 = CRSF_CH_MIN (172,  LOW)  → quad disarmed
+    Configure your FC arming switch on AUX1 (Ch5), arm threshold > ~1700.
 
 CRSF frame structure (26 bytes):
     [0]     0xEE  destination address (CRSF_ADDRESS_MODULE)
@@ -191,14 +196,14 @@ class GamepadReader:
         rb  = float(s.get("BTN_TR", 0))
 
         active = [
-            axis_to_crsf(ly),      # Ch1  LY
-            axis_to_crsf(lx),      # Ch2  LX
-            axis_to_crsf(ry),      # Ch3  RY
-            axis_to_crsf(rx),      # Ch4  RX
-            trigger_to_crsf(lt),   # Ch5  LT
-            trigger_to_crsf(rt),   # Ch6  RT
-            button_to_crsf(lb),    # Ch7  LB
-            button_to_crsf(rb),    # Ch8  RB
+            axis_to_crsf(ly),      # Ch1  LY  — Throttle/Pitch
+            axis_to_crsf(lx),      # Ch2  LX  — Yaw
+            axis_to_crsf(ry),      # Ch3  RY  — Pitch/Throttle
+            axis_to_crsf(rx),      # Ch4  RX  — Roll
+            button_to_crsf(lb),    # Ch5  LB  — ARM (high = armed, low = disarmed)
+            button_to_crsf(rb),    # Ch6  RB  — Aux 2 / flight mode
+            trigger_to_crsf(lt),   # Ch7  LT  — Aux 3
+            trigger_to_crsf(rt),   # Ch8  RT  — Aux 4
         ]
         return active + [CRSF_CH_MID] * (CHAN_COUNT - ACTIVE_CHANS)
 

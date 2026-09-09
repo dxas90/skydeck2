@@ -115,11 +115,14 @@ Byte  25          — CRC-8/DVB-S2 of bytes [2..24]
 | 2  | Left stick X  | Yaw |
 | 3  | Right stick Y | Pitch (Mode 2) / Throttle (Mode 1) |
 | 4  | Right stick X | Roll |
-| 5  | Left trigger  | Aux 1 |
-| 6  | Right trigger | Aux 2 |
-| 7  | Left bumper   | Arm / flight-mode switch |
-| 8  | Right bumper  | Aux 4 |
+| 5  | **Left bumper**  | **ARM — held HIGH = armed, released = disarmed** |
+| 6  | Right bumper  | Aux 2 / flight-mode switch |
+| 7  | Left trigger  | Aux 3 |
+| 8  | Right trigger | Aux 4 |
 | 9-16 | — | Parked at CRSF mid (991) |
+
+> FC setup: assign AUX1 (Ch5) as your arm switch with arm threshold above ~1700.
+> LB held = 1811 (armed). LB released = 172 (disarmed).
 
 All active channels map to CRSF range **172 (min) … 991 (mid) … 1811 (max)**.
 
