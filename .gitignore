@@ -15,6 +15,9 @@ skydeck_env/
 deck.log
 aviateur.AppImage
 
+# WFB-NG keypair — secret, never commit
+gs.key
+
 # Editor
 .vscode/
 .idea/

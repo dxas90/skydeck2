@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Aviateur FPV
+Comment=OpenIPC FPV live video ground station (WFB-NG / RTL8812AU)
+Exec=/home/deck/SkyDeck/aviateur.sh
+Path=/home/deck/SkyDeck
+Terminal=false
+Icon=/home/deck/SkyDeck/skydeck_icon.png
+Categories=Game;

@@ -45,7 +45,7 @@ RTL8812AU USB WiFi
 ```bash
 git clone <your-fork-url> ~/SkyDeck
 cd ~/SkyDeck
-chmod +x install.sh deck.sh
+chmod +x install.sh deck.sh aviateur.sh
 ./install.sh
 ```
 
@@ -54,7 +54,10 @@ chmod +x install.sh deck.sh
 - Install `pyserial` and `inputs` into it
 - Download the latest Aviateur `.AppImage` from GitHub releases
 - Install the RTL8812AU udev rule (`/etc/udev/rules.d/80-my8812au.rules`)
-- Install the `.desktop` launcher for KDE / Steam
+- Blacklist `rtw88_8812au` so Aviateur can claim the adapter via libusb
+- Set `CAP_NET_ADMIN` on the AppImage (no sudo needed at runtime)
+- Install gs.key into `~/.aviateur/` if `gs.key` is present in the project dir
+- Install `.desktop` launchers for KDE / Steam
 
 ### 2. Run
 
@@ -78,10 +81,61 @@ chmod +x install.sh deck.sh
 ### 3. Launch Aviateur (FPV video)
 
 ```bash
-./aviateur.AppImage
+./aviateur.sh
 ```
 
-Or launch it from the KDE application menu / Steam as a Non-Steam Game.
+Or launch it from the KDE app menu / Steam as a Non-Steam Game.
+`aviateur.sh` auto-resolves the KDE display credentials and keeps the
+Aviateur `pid_vid` config entry in sync with the current USB device number.
+
+---
+
+## Aviateur Setup Notes
+
+### USB port — critical
+
+Plug the RTL8812AU adapter into the **Steam Deck USB-C port directly**,
+not through a hub or dock. The Steam Deck's internal USB 2.0 hub limits
+bulk transfer size to ~1015 bytes; Aviateur's `devourer` driver needs
+~4000+ byte transfers for WFB-NG aggregated packets. Going through the
+hub causes `RX Warning / transfer_len` errors and `Unable to decrypt`
+even with the correct key.
+
+### WFB-NG key (gs.key)
+
+Aviateur and the drone must share a matching Curve25519 keypair.
+The drone ships with a key at `/etc/drone.key`.
+
+```bash
+# 1. Connect the drone via Ethernet (e.g. RunCam WiFiLink 2: 192.168.1.10)
+sudo ip addr add 192.168.1.2/24 dev <ethernet-iface>
+
+# 2. Copy the key (default password: 12345)
+scp root@192.168.1.10:/etc/drone.key ./gs.key
+
+# 3. Re-run install.sh to deploy it
+./install.sh
+```
+
+### RunCam WiFiLink 2 drone settings
+
+Confirmed working configuration:
+
+| Setting | Value |
+|---------|-------|
+| Channel | 161 (5.805 GHz) |
+| Width | 20 MHz |
+| Codec | H.265 |
+| FPS | 120 |
+| Resolution | 1280×720 |
+| MCS index | 2 |
+| FEC | 8/12 |
+| STBC | on |
+| LDPC | on |
+| Link ID | 7669206 (default) |
+
+Aviateur config must match: `channel = 161`, `channel_width_mode = 0` (20 MHz),
+`codec = H265`.
 
 ---
 
@@ -134,9 +188,14 @@ All active channels map to CRSF range **172 (min) … 991 (mid) … 1811 (max)**
 ```
 skydeck2/
   install.sh                    # one-time setup script
-  deck.sh                       # runtime launcher
-  skydeck.desktop               # KDE / Steam desktop entry
+  deck.sh                       # RC sender launcher
+  aviateur.sh                   # Aviateur FPV launcher (display-aware wrapper)
+  skydeck.desktop               # KDE / Steam desktop entry (RC sender)
+  aviateur.desktop              # KDE / Steam desktop entry (Aviateur)
   skydeck_joystick_sender.py    # Python CRSF sender
+  crsf.py                       # shared CRSF protocol library
+  elrs_config.py                # interactive ELRS configurator TUI
+  gs.key                        # WFB-NG keypair (copy from drone, not tracked)
   skydeck_env/                  # uv venv (created by install.sh, not tracked)
   aviateur.AppImage             # downloaded by install.sh, not tracked
   deck.log                      # runtime log (not tracked)
