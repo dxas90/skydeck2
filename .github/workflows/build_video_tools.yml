@@ -207,6 +207,17 @@ jobs:
           }
           EOF
 
+      - name: Stub out GUI-only submodules (vecgui, SDL) for headless build
+        run: |
+          # Aviateur's CMakeLists.txt unconditionally adds vecgui and SDL.
+          # We don't have those submodules. Provide empty stubs so cmake
+          # configure passes, then the build itself only needs the wifi stack.
+          mkdir -p /tmp/aviateur-src/3rd/vecgui /tmp/aviateur-src/3rd/SDL
+          echo "# headless stub — vecgui not needed for skydeck_rx" \
+            > /tmp/aviateur-src/3rd/vecgui/CMakeLists.txt
+          echo "# headless stub — SDL not needed for skydeck_rx" \
+            > /tmp/aviateur-src/3rd/SDL/CMakeLists.txt
+
       - name: Configure skydeck_rx (headless Aviateur wifi stack)
         run: |
           cmake -S /tmp/aviateur-src -B /tmp/skydeck-rx-build \
