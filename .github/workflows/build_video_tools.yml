@@ -207,35 +207,92 @@ jobs:
           }
           EOF
 
-      - name: Stub out GUI-only submodules (vecgui, SDL) for headless build
+      - name: Write standalone CMakeLists.txt (bypass Aviateur GUI build system)
         run: |
-          # Aviateur's CMakeLists.txt unconditionally adds vecgui and SDL.
-          # We don't have those submodules. Provide empty stubs so cmake
-          # configure passes, then the build itself only needs the wifi stack.
-          mkdir -p /tmp/aviateur-src/3rd/vecgui /tmp/aviateur-src/3rd/SDL
-          echo "# headless stub — vecgui not needed for skydeck_rx" \
-            > /tmp/aviateur-src/3rd/vecgui/CMakeLists.txt
-          echo "# headless stub — SDL not needed for skydeck_rx" \
-            > /tmp/aviateur-src/3rd/SDL/CMakeLists.txt
+          # Aviateur's CMakeLists.txt is tightly coupled to SDL3/vecgui.
+          # Write our own minimal build that pulls only what skydeck_rx needs:
+          #   devourer (3rd/devourer) + aviateur wifi stack (src/wifi/) + ffmpeg
+          mkdir -p /tmp/skydeck_rx_build
+          cat > /tmp/skydeck_rx_build/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(skydeck_rx LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 20)
 
-      - name: Configure skydeck_rx (headless Aviateur wifi stack)
+          find_package(PkgConfig REQUIRED)
+          pkg_check_modules(LIBUSB    REQUIRED IMPORTED_TARGET libusb-1.0)
+          pkg_check_modules(LIBSODIUM REQUIRED IMPORTED_TARGET libsodium)
+          pkg_check_modules(LIBPCAP   REQUIRED IMPORTED_TARGET libpcap)
+          pkg_check_modules(LIBAV     REQUIRED IMPORTED_TARGET
+              libavformat libavcodec libswresample libswscale libavutil)
+
+          # devourer — RTL8812AU userspace driver
+          set(DEVOURER_8814          OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_JAGUAR2_8822B OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_JAGUAR2_8821C OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_JAGUAR3_8822C OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_JAGUAR3_8822E OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_8733B         OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_KESTREL_8852B OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_KESTREL_8852C OFF CACHE BOOL "" FORCE)
+          set(DEVOURER_LOG_MAX_LEVEL WARN CACHE STRING "" FORCE)
+          add_subdirectory(${AVIATEUR_SRC}/3rd/devourer devourer_build EXCLUDE_FROM_ALL)
+
+          # Aviateur wifi stack (WFB-NG aggregator + ffmpeg player)
+          file(GLOB WIFI_SRCS
+              ${AVIATEUR_SRC}/src/wifi/*.cpp
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.c
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.cpp
+              ${AVIATEUR_SRC}/src/wifi/linux/*.cpp
+          )
+          file(GLOB PLAYER_SRCS
+              ${AVIATEUR_SRC}/src/player/*.cpp
+          )
+
+          add_executable(skydeck_rx
+              ${HEADLESS_MAIN}
+              ${WIFI_SRCS}
+              ${PLAYER_SRCS}
+          )
+
+          target_compile_definitions(skydeck_rx PRIVATE
+              ZFEX_UNROLL_ADDMUL_SIMD=8
+              ZFEX_USE_INTEL_SSSE3
+              ZFEX_INLINE_ADDMUL
+              ZFEX_INLINE_ADDMUL_SIMD
+          )
+
+          target_include_directories(skydeck_rx PRIVATE
+              ${AVIATEUR_SRC}/src
+              ${AVIATEUR_SRC}/src/wifi
+              ${AVIATEUR_SRC}/src/wifi/compat
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng
+              ${AVIATEUR_SRC}/3rd/devourer/src
+              ${AVIATEUR_SRC}/3rd/devourer/hal
+              ${AVIATEUR_SRC}/3rd/json/include
+              ${AVIATEUR_SRC}/3rd/mINI/src
+          )
+
+          target_link_libraries(skydeck_rx PRIVATE
+              devourer
+              PkgConfig::LIBAV
+              PkgConfig::LIBSODIUM
+              PkgConfig::LIBPCAP
+          )
+          EOF
+
+      - name: Configure skydeck_rx
         run: |
-          cmake -S /tmp/aviateur-src -B /tmp/skydeck-rx-build \
+          cmake -S /tmp/skydeck_rx_build -B /tmp/skydeck_rx_cmake \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_STANDARD=20 \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
-            -DAVIATEUR_HEADLESS=ON \
-            -DAVIATEUR_HEADLESS_MAIN=/tmp/aviateur-src/src/headless_main.cpp \
-            || cmake -S /tmp/aviateur-src -B /tmp/skydeck-rx-build \
-                 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
+            -DAVIATEUR_SRC=/tmp/aviateur-src \
+            -DHEADLESS_MAIN=/tmp/aviateur-src/src/headless_main.cpp
 
       - name: Build skydeck_rx
         run: |
-          # Try to build — if Aviateur's CMake doesn't support headless mode,
-          # fall back to building the full aviateur binary as skydeck_rx
-          cmake --build /tmp/skydeck-rx-build --parallel 2>&1 | tail -20
-          BINARY=$(find /tmp/skydeck-rx-build -name "aviateur" -o -name "skydeck_rx" | head -1)
+          cmake --build /tmp/skydeck_rx_cmake --parallel 2>&1 | tail -30
+          BINARY=$(find /tmp/skydeck_rx_cmake -name "skydeck_rx" -type f | head -1)
           echo "SKYDECK_RX=$BINARY" >> "$GITHUB_ENV"
           echo "Binary: $BINARY"
           file "$BINARY"
