@@ -146,11 +146,11 @@ jobs:
 
       - name: Write headless main (no GUI, no SDL — just devourer + wfb + UDP out)
         run: |
-          cat > /tmp/aviateur-src/src/headless_main.cpp << 'EOF'
+          python3 - << 'PYEOF'
+          import textwrap, pathlib
+          src = textwrap.dedent("""
           /*
            * headless_main.cpp — SkyDeck headless WFB-NG receiver
-           * Compiled in place of Aviateur's main.cpp when building skydeck_rx.
-           * Uses the same WfbngLink + ffmpeg player stack, outputs video to UDP.
            */
           #include <csignal>
           #include <cstdio>
@@ -159,61 +159,46 @@ jobs:
           #include <string>
           #include <thread>
           #include <chrono>
-
           #include "wifi/wfbng_link.h"
-          #include "player/udp_player.h"
 
           static std::atomic<bool> g_stop{false};
           static void handle_sig(int) { g_stop = true; }
-
-          static int  env_int(const char *n, int def)  { auto v=std::getenv(n); return v?std::atoi(v):def; }
+          static int env_int(const char *n, int d) { auto v=std::getenv(n); return v?std::atoi(v):d; }
           static std::string env_str(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
 
           int main() {
               std::signal(SIGINT,  handle_sig);
               std::signal(SIGTERM, handle_sig);
-
-              const int       channel   = env_int("SKYDECK_CHANNEL",  161);
-              const int       bw        = env_int("SKYDECK_BW",        0);   // 0=20MHz 1=40MHz
-              const int       out_port  = env_int("SKYDECK_PORT",    5600);
-              const uint32_t  link_id   = (uint32_t)env_int("SKYDECK_LINK_ID", 7669206);
-              std::string key = env_str("SKYDECK_KEY",
-                  std::string(std::getenv("HOME") ?: "") + "/.aviateur/gs.key");
-
-              fprintf(stderr, "[skydeck_rx] channel=%d bw=%s key=%s port=%d\n",
+              const int      channel  = env_int("SKYDECK_CHANNEL", 161);
+              const int      bw       = env_int("SKYDECK_BW",        0);
+              const int      out_port = env_int("SKYDECK_PORT",    5600);
+              std::string    key      = env_str("SKYDECK_KEY",
+                  std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/.aviateur/gs.key");
+              fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d\\n",
                       channel, bw ? "40MHz" : "20MHz", key.c_str(), out_port);
-
-              // Enumerate adapters
               auto devices = WfbngLink::get_device_list();
-              if (devices.empty()) {
-                  fprintf(stderr, "[skydeck_rx] No supported adapters found\n");
-                  return 1;
-              }
-              fprintf(stderr, "[skydeck_rx] Using: %s\n", devices[0].display_name.c_str());
-
+              if (devices.empty()) { fprintf(stderr, "[skydeck_rx] No adapter found\\n"); return 1; }
+              fprintf(stderr, "[skydeck_rx] Using: %s\\n", devices[0].display_name.c_str());
               WfbngLink link;
               if (!link.start(devices[0], (uint8_t)channel, bw, key)) {
-                  fprintf(stderr, "[skydeck_rx] Failed to start WfbngLink\n");
-                  return 1;
+                  fprintf(stderr, "[skydeck_rx] Start failed\\n"); return 1;
               }
-
-              fprintf(stderr, "[skydeck_rx] Receiving — video → udp://127.0.0.1:%d\n", out_port);
-              while (!g_stop) {
-                  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-              }
-
+              fprintf(stderr, "[skydeck_rx] Receiving → udp://127.0.0.1:%d\\n", out_port);
+              while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(500));
               link.stop();
               return 0;
           }
-          EOF
+          """).lstrip()
+          pathlib.Path("/tmp/aviateur-src/src/headless_main.cpp").write_text(src)
+          print("headless_main.cpp written", len(src), "bytes")
+          PYEOF
 
       - name: Write standalone CMakeLists.txt (bypass Aviateur GUI build system)
         run: |
-          # Aviateur's CMakeLists.txt is tightly coupled to SDL3/vecgui.
-          # Write our own minimal build that pulls only what skydeck_rx needs:
-          #   devourer (3rd/devourer) + aviateur wifi stack (src/wifi/) + ffmpeg
           mkdir -p /tmp/skydeck_rx_build
-          cat > /tmp/skydeck_rx_build/CMakeLists.txt << 'EOF'
+          python3 - << 'PYEOF'
+          import textwrap, pathlib
+          cmake = textwrap.dedent("""
           cmake_minimum_required(VERSION 3.18)
           project(skydeck_rx LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 20)
@@ -225,7 +210,6 @@ jobs:
           pkg_check_modules(LIBAV     REQUIRED IMPORTED_TARGET
               libavformat libavcodec libswresample libswscale libavutil)
 
-          # devourer — RTL8812AU userspace driver
           set(DEVOURER_8814          OFF CACHE BOOL "" FORCE)
           set(DEVOURER_JAGUAR2_8822B OFF CACHE BOOL "" FORCE)
           set(DEVOURER_JAGUAR2_8821C OFF CACHE BOOL "" FORCE)
@@ -237,29 +221,18 @@ jobs:
           set(DEVOURER_LOG_MAX_LEVEL WARN CACHE STRING "" FORCE)
           add_subdirectory(${AVIATEUR_SRC}/3rd/devourer devourer_build EXCLUDE_FROM_ALL)
 
-          # Aviateur wifi stack (WFB-NG aggregator + ffmpeg player)
           file(GLOB WIFI_SRCS
               ${AVIATEUR_SRC}/src/wifi/*.cpp
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.c
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.cpp
-              ${AVIATEUR_SRC}/src/wifi/linux/*.cpp
-          )
-          file(GLOB PLAYER_SRCS
-              ${AVIATEUR_SRC}/src/player/*.cpp
-          )
+              ${AVIATEUR_SRC}/src/wifi/linux/*.cpp)
+          file(GLOB PLAYER_SRCS ${AVIATEUR_SRC}/src/player/*.cpp)
 
-          add_executable(skydeck_rx
-              ${HEADLESS_MAIN}
-              ${WIFI_SRCS}
-              ${PLAYER_SRCS}
-          )
+          add_executable(skydeck_rx ${HEADLESS_MAIN} ${WIFI_SRCS} ${PLAYER_SRCS})
 
           target_compile_definitions(skydeck_rx PRIVATE
-              ZFEX_UNROLL_ADDMUL_SIMD=8
-              ZFEX_USE_INTEL_SSSE3
-              ZFEX_INLINE_ADDMUL
-              ZFEX_INLINE_ADDMUL_SIMD
-          )
+              ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_USE_INTEL_SSSE3
+              ZFEX_INLINE_ADDMUL ZFEX_INLINE_ADDMUL_SIMD)
 
           target_include_directories(skydeck_rx PRIVATE
               ${AVIATEUR_SRC}/src
@@ -269,16 +242,14 @@ jobs:
               ${AVIATEUR_SRC}/3rd/devourer/src
               ${AVIATEUR_SRC}/3rd/devourer/hal
               ${AVIATEUR_SRC}/3rd/json/include
-              ${AVIATEUR_SRC}/3rd/mINI/src
-          )
+              ${AVIATEUR_SRC}/3rd/mINI/src)
 
           target_link_libraries(skydeck_rx PRIVATE
-              devourer
-              PkgConfig::LIBAV
-              PkgConfig::LIBSODIUM
-              PkgConfig::LIBPCAP
-          )
-          EOF
+              devourer PkgConfig::LIBAV PkgConfig::LIBSODIUM PkgConfig::LIBPCAP)
+          """).lstrip()
+          pathlib.Path("/tmp/skydeck_rx_build/CMakeLists.txt").write_text(cmake)
+          print("CMakeLists.txt written", len(cmake), "bytes")
+          PYEOF
 
       - name: Configure skydeck_rx
         run: |
