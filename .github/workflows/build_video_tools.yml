@@ -149,8 +149,12 @@ jobs:
           src = textwrap.dedent("""
           /*
            * headless_main.cpp — SkyDeck headless WFB-NG receiver
-           * devourer (RTL8812AU libusb) + wfb-ng Forwarder (UDP output)
-           * Outputs raw WFB-NG RTP to udp://127.0.0.1:SKYDECK_PORT
+           * devourer (RTL8812AU libusb) + wfb-ng Aggregator (decrypt+FEC) → UDP
+           * Outputs DECODED video RTP to udp://127.0.0.1:SKYDECK_PORT
+           * Compatible with any player:
+           *   gst-launch-1.0 udpsrc port=5600 ! h265parse ! avdec_h265 ! autovideosink
+           *   gst-launch-1.0 udpsrc port=5600 ! h264parse ! openh264dec ! autovideosink
+           *   vlc udp://@:5600
            *
            * Env vars:
            *   SKYDECK_CHANNEL   WiFi channel (default 161)
@@ -159,6 +163,7 @@ jobs:
            *   SKYDECK_LINK_ID   WFB-NG link_id (default 7669206)
            *   SKYDECK_KEY       gs.key path (default ~/.aviateur/gs.key)
            */
+          #include <arpa/inet.h>
           #include <csignal>
           #include <cstdio>
           #include <cstdlib>
@@ -197,11 +202,30 @@ jobs:
               fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d link_id=%u\\n",
                       ch_num, bw_idx?"40MHz":"20MHz", key.c_str(), port, link_id);
 
-              // Forwarder: concrete subclass of Aggregator that sends decoded video to UDP.
-              // Aggregator(keypair_path, epoch, channel_id)
-              // Forwarder(client_addr, client_port, snd_buf_size)
-              // We use Forwarder which already implements send_to_socket via UDP.
-              auto fwd = std::make_unique<Forwarder>("127.0.0.1", port, 0);
+              // VideoOut subclasses Aggregator (abstract) and implements send_to_socket.
+              // Aggregator(key, epoch, link_id) does WFB-NG decrypt+FEC, then calls
+              // send_to_socket(payload, size) with decoded video — we forward to UDP.
+              // Any player works: gst-launch, mpv, VLC.
+              class VideoOut : public Aggregator {
+              public:
+                  VideoOut(const std::string &k, uint32_t lid, const std::string &a, int p)
+                      : Aggregator(k, 0, lid) {
+                      fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+                      memset(&sa_, 0, sizeof(sa_));
+                      sa_.sin_family = AF_INET;
+                      sa_.sin_port = htons(p);
+                      sa_.sin_addr.s_addr = inet_addr(a.c_str());
+                  }
+                  ~VideoOut() { if (fd_>=0) close(fd_); }
+              protected:
+                  void send_to_socket(const uint8_t *buf, uint16_t len) override {
+                      sendto(fd_, buf, len, 0, (sockaddr*)&sa_, sizeof(sa_));
+                  }
+              private:
+                  int fd_=-1;
+                  sockaddr_in sa_{};
+              };
+              auto fwd = std::make_unique<VideoOut>(key, link_id, "127.0.0.1", port);
 
               libusb_context *ctx = nullptr;
               if (libusb_init(&ctx) != 0) {
