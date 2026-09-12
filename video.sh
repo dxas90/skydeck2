@@ -98,57 +98,55 @@ run_aviateur() {
 }
 
 # ---------------------------------------------------------------------------
-# MODE B — wfb-ng (requires rtl88xxau_wfb kernel driver)
+# MODE B — devourer rxdemo + wfb_rx
+#
+# Uses the pre-built rxdemo binary (downloaded by install.sh from CI release).
+# rxdemo is configured entirely via environment variables — no CLI flags.
+# See: https://github.com/OpenIPC/devourer (src/DeviceConfig.h for full list)
+#
+# Stack:
+#   rxdemo  (devourer, libusb)  →  raw 802.11 frames on UDP
+#   wfb_rx  (wfb-ng C binary)  →  decrypted RTP video on UDP 5600
+#   player  (mpv / gstreamer)  →  display
 # ---------------------------------------------------------------------------
 run_wfb_ng() {
-  log "Mode B: wfb-ng + kernel driver"
+  log "Mode B: devourer rxdemo + wfb_rx + player"
 
-  # Find the monitor-mode wlan interface (driven by rtl88xxau_wfb)
-  WLAN_IF=""
-  for iface in $(find /sys/class/net/ -maxdepth 1 -type l | xargs -I{} basename {}); do
-    if udevadm info "/sys/class/net/$iface" 2>/dev/null | grep -qE 'ID_NET_DRIVER=rtl88xxau_wfb'; then
-      WLAN_IF="$iface"
-      break
-    fi
-  done
-
-  if [[ -z "$WLAN_IF" ]]; then
-    log "No rtl88xxau_wfb interface found."
-    log "Install the wfb-ng patched driver: https://github.com/svpcom/rtl8812au"
-    log "Falling back to Mode C (direct UDP)..."
-    run_direct_udp
-    return
-  fi
-
-  log "Using interface: $WLAN_IF"
-
-  # Set monitor mode
-  sudo ip link set "$WLAN_IF" down
-  sudo iw dev "$WLAN_IF" set type monitor
-  sudo ip link set "$WLAN_IF" up
-  sudo iw dev "$WLAN_IF" set channel 161
+  RXDEMO="$SCRIPT_DIR/rxdemo"
+  [[ -x "$RXDEMO" ]] || die "rxdemo not found at $SCRIPT_DIR/rxdemo. Run install.sh first."
 
   GS_KEY="${HOME}/.aviateur/gs.key"
   [[ -f "$SCRIPT_DIR/gs.key" ]] && GS_KEY="$SCRIPT_DIR/gs.key"
 
-  # Build wfb_rx command:
-  #   -K key  -p radio_port  -u client_port  interface
-  #   radio_port for video on RunCam WiFiLink 2 = default (no -p flag needed)
-  WFB_RX_CMD=(wfb_rx)
-  [[ -f "$GS_KEY" ]] && WFB_RX_CMD+=(-K "$GS_KEY")
-  WFB_RX_CMD+=(-u "$UDP_PORT" "$WLAN_IF")
+  # devourer config via environment variables
+  export DEVOURER_CHANNEL=161
+  export DEVOURER_BW=20                      # 20 MHz — matches RunCam WiFiLink 2
+  export DEVOURER_OUT_PORT="$WFB_RX_PORT"    # raw frames → wfb_rx
+  [[ -f "$GS_KEY" ]] && export DEVOURER_KEY="$GS_KEY"
 
+  WFB_RX_PORT=5800   # devourer → wfb_rx raw input port
   PLAYER_CMD=$(make_player_cmd "$UDP_PORT" "$CODEC")
 
-  # Cleanup
   PIDS=()
   cleanup() { for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done; }
   trap cleanup EXIT INT TERM
 
-  "${WFB_RX_CMD[@]}" &
+  log "Starting rxdemo (channel $DEVOURER_CHANNEL, BW ${DEVOURER_BW}MHz)..."
+  "$RXDEMO" &
   PIDS+=($!)
-  log "wfb_rx PID: ${PIDS[-1]}"
-  sleep 1
+  sleep 2
+
+  if command -v wfb_rx &>/dev/null; then
+    log "Starting wfb_rx → UDP $UDP_PORT..."
+    GS_KEY_ARGS=()
+    [[ -f "$GS_KEY" ]] && GS_KEY_ARGS=(-K "$GS_KEY")
+    wfb_rx "${GS_KEY_ARGS[@]}" -u "$UDP_PORT" -a "$WFB_RX_PORT" &
+    PIDS+=($!)
+    sleep 1
+  else
+    log "wfb_rx not found — install wfb-ng for full decryption."
+    log "Trying direct UDP passthrough on port $UDP_PORT..."
+  fi
 
   log "Starting player on UDP $UDP_PORT..."
   eval "$PLAYER_CMD"

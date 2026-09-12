@@ -22,11 +22,13 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 VENV_DIR="$SCRIPT_DIR/skydeck_env"
 AVIATEUR_APPIMAGE="$SCRIPT_DIR/aviateur.AppImage"
+RXDEMO="$SCRIPT_DIR/rxdemo"
 UDEV_RULES_FILE="/etc/udev/rules.d/80-my8812au.rules"
 UDEV_RULES_URL="https://raw.githubusercontent.com/OpenIPC/aviateur/refs/heads/main/80-my8812au.rules"
 ATOMIC_UPDATE_CONF="/etc/atomic-update.conf.d/skydeck.conf"
 RTW_BLACKLIST="/etc/modprobe.d/aviateur-rtl8812au.conf"
 AVIATEUR_API="https://api.github.com/repos/OpenIPC/aviateur/releases/latest"
+SKYDECK_API="https://api.github.com/repos/dxas90/skydeck2/releases/latest"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +98,46 @@ for a in assets:
   curl -L --progress-bar -o "$AVIATEUR_APPIMAGE" "$APPIMAGE_URL"
   chmod +x "$AVIATEUR_APPIMAGE"
   log "Aviateur AppImage saved to $AVIATEUR_APPIMAGE"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3b: Download pre-built devourer rxdemo (wfb-ng alternative video pipeline)
+#
+# rxdemo is the receive-side binary from OpenIPC/devourer — a userspace
+# RTL8812AU driver built in CI and shipped as a release asset.
+# Used by video.sh --mode b as an alternative to Aviateur.
+# ---------------------------------------------------------------------------
+if [[ -f "$RXDEMO" ]]; then
+  log "rxdemo already present — skipping download."
+else
+  log "Fetching rxdemo from latest SkyDeck release..."
+  RXDEMO_URL=$(
+    curl -fsSL "$SKYDECK_API" 2>/dev/null \
+      | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for a in data.get('assets', []):
+    if 'rxdemo' in a['name'] and 'linux' in a['name']:
+        print(a['browser_download_url'])
+        break
+" 2>/dev/null
+  )
+
+  if [[ -n "$RXDEMO_URL" ]]; then
+    log "Downloading rxdemo from: $RXDEMO_URL"
+    RXDEMO_TGZ="$SCRIPT_DIR/rxdemo.tar.gz"
+    curl -L --progress-bar -o "$RXDEMO_TGZ" "$RXDEMO_URL"
+    tar -xzf "$RXDEMO_TGZ" -C "$SCRIPT_DIR" rxdemo
+    rm -f "$RXDEMO_TGZ"
+    chmod +x "$RXDEMO"
+    sudo setcap cap_net_admin,cap_net_raw=eip "$RXDEMO" 2>/dev/null || \
+      log "Note: setcap failed for rxdemo — video.sh --mode b may need sudo."
+    log "rxdemo installed: $RXDEMO"
+  else
+    log "No rxdemo release asset found yet (first release not yet published)."
+    log "  video.sh --mode a (Aviateur) is unaffected."
+    log "  To build rxdemo manually: see build_wfb.sh"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

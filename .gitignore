@@ -14,6 +14,7 @@ skydeck_env/
 # Runtime artefacts
 deck.log
 aviateur.AppImage
+rxdemo
 
 # WFB-NG keypair — secret, never commit
 gs.key
