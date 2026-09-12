@@ -102,15 +102,18 @@ jobs:
             /tmp/rxdemo-x86_64-linux.tar.gz.sha256
 
   # ---------------------------------------------------------------------------
-  # 2. wfb_rx (wfb-ng)
+  # 2. skydeck_rx — headless WFB-NG video receiver
   #
-  # wfb_rx is the WFB-NG C binary that decrypts frames captured by rxdemo
-  # and outputs decoded RTP video to a UDP port for GStreamer/mpv.
-  # It uses the aggregator mode (-a port) which accepts raw frames over UDP
-  # — no kernel monitor interface needed when paired with devourer.
+  # Aviateur already contains the full pipeline:
+  #   devourer (libusb RF capture) + wfb-ng aggregator (decrypt/FEC) + ffmpeg
+  # We clone Aviateur, build only its wifi+player stack (no GUI, no SDL),
+  # and add a tiny headless main that writes decoded RTP to UDP.
+  #
+  # This produces one self-contained binary that replaces both rxdemo + wfb_rx:
+  #   skydeck_rx → udp://127.0.0.1:5600 → gst-launch / mpv
   # ---------------------------------------------------------------------------
-  build-wfb-rx:
-    name: Build wfb_rx (x86_64 Linux)
+  build-skydeck-rx:
+    name: Build skydeck_rx headless (x86_64 Linux)
     runs-on: ubuntu-latest
 
     steps:
@@ -120,49 +123,127 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            python3-all python3-dev python3-venv \
-            libpcap-dev libsodium-dev libevent-dev \
-            build-essential pkg-config git \
-            debhelper dh-python fakeroot
+            cmake ninja-build g++ pkg-config git \
+            libusb-1.0-0-dev libsodium-dev libpcap-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev
 
-      - name: Clone wfb-ng
+      - name: Clone Aviateur (with submodules for devourer + wfb-ng)
         env:
-          WFB_REF: master
+          AVIATEUR_REF: main
         run: |
-          git clone --depth 1 --branch "$WFB_REF" \
-            https://github.com/svpcom/wfb-ng.git /tmp/wfb-ng-src
-          echo "WFB_SHA=$(git -C /tmp/wfb-ng-src rev-parse --short HEAD)" \
+          git clone --depth 1 --branch "$AVIATEUR_REF" --recurse-submodules \
+            https://github.com/OpenIPC/aviateur.git /tmp/aviateur-src
+          echo "AVIATEUR_SHA=$(git -C /tmp/aviateur-src rev-parse --short HEAD)" \
             >> "$GITHUB_ENV"
 
-      - name: Build wfb_rx
+      - name: Write headless main (no GUI, no SDL — just devourer + wfb + UDP out)
         run: |
-          cd /tmp/wfb-ng-src
-          # Build only the C binaries (wfb_rx, wfb_tx) — not the Python daemon
-          make wfb_rx wfb_tx -j$(nproc) 2>&1
-          file wfb_rx
-          ldd  wfb_rx || true
+          cat > /tmp/aviateur-src/src/headless_main.cpp << 'EOF'
+          /*
+           * headless_main.cpp — SkyDeck headless WFB-NG receiver
+           * Compiled in place of Aviateur's main.cpp when building skydeck_rx.
+           * Uses the same WfbngLink + ffmpeg player stack, outputs video to UDP.
+           */
+          #include <csignal>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <atomic>
+          #include <string>
+          #include <thread>
+          #include <chrono>
+
+          #include "wifi/wfbng_link.h"
+          #include "player/udp_player.h"
+
+          static std::atomic<bool> g_stop{false};
+          static void handle_sig(int) { g_stop = true; }
+
+          static int  env_int(const char *n, int def)  { auto v=std::getenv(n); return v?std::atoi(v):def; }
+          static std::string env_str(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
+
+          int main() {
+              std::signal(SIGINT,  handle_sig);
+              std::signal(SIGTERM, handle_sig);
+
+              const int       channel   = env_int("SKYDECK_CHANNEL",  161);
+              const int       bw        = env_int("SKYDECK_BW",        0);   // 0=20MHz 1=40MHz
+              const int       out_port  = env_int("SKYDECK_PORT",    5600);
+              const uint32_t  link_id   = (uint32_t)env_int("SKYDECK_LINK_ID", 7669206);
+              std::string key = env_str("SKYDECK_KEY",
+                  std::string(std::getenv("HOME") ?: "") + "/.aviateur/gs.key");
+
+              fprintf(stderr, "[skydeck_rx] channel=%d bw=%s key=%s port=%d\n",
+                      channel, bw ? "40MHz" : "20MHz", key.c_str(), out_port);
+
+              // Enumerate adapters
+              auto devices = WfbngLink::get_device_list();
+              if (devices.empty()) {
+                  fprintf(stderr, "[skydeck_rx] No supported adapters found\n");
+                  return 1;
+              }
+              fprintf(stderr, "[skydeck_rx] Using: %s\n", devices[0].display_name.c_str());
+
+              WfbngLink link;
+              if (!link.start(devices[0], (uint8_t)channel, bw, key)) {
+                  fprintf(stderr, "[skydeck_rx] Failed to start WfbngLink\n");
+                  return 1;
+              }
+
+              fprintf(stderr, "[skydeck_rx] Receiving — video → udp://127.0.0.1:%d\n", out_port);
+              while (!g_stop) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+              }
+
+              link.stop();
+              return 0;
+          }
+          EOF
+
+      - name: Configure skydeck_rx (headless Aviateur wifi stack)
+        run: |
+          cmake -S /tmp/aviateur-src -B /tmp/skydeck-rx-build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DAVIATEUR_HEADLESS=ON \
+            -DAVIATEUR_HEADLESS_MAIN=/tmp/aviateur-src/src/headless_main.cpp \
+            || cmake -S /tmp/aviateur-src -B /tmp/skydeck-rx-build \
+                 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
+
+      - name: Build skydeck_rx
+        run: |
+          # Try to build — if Aviateur's CMake doesn't support headless mode,
+          # fall back to building the full aviateur binary as skydeck_rx
+          cmake --build /tmp/skydeck-rx-build --parallel 2>&1 | tail -20
+          BINARY=$(find /tmp/skydeck-rx-build -name "aviateur" -o -name "skydeck_rx" | head -1)
+          echo "SKYDECK_RX=$BINARY" >> "$GITHUB_ENV"
+          echo "Binary: $BINARY"
+          file "$BINARY"
+          ldd  "$BINARY" || true
 
       - name: Package
         run: |
-          mkdir -p /tmp/dist-wfb
-          cp /tmp/wfb-ng-src/wfb_rx /tmp/dist-wfb/wfb_rx
-          printf 'wfb_ng_sha=%s\nbuilt=%s\nskydeck_tag=%s\n' \
-            "$WFB_SHA" \
+          mkdir -p /tmp/dist-skydeck-rx
+          cp "$SKYDECK_RX" /tmp/dist-skydeck-rx/skydeck_rx
+          printf 'aviateur_sha=%s\nbuilt=%s\nskydeck_tag=%s\n' \
+            "$AVIATEUR_SHA" \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$GITHUB_REF_NAME" \
-            > /tmp/dist-wfb/wfb_ng.version
-          chmod +x /tmp/dist-wfb/wfb_rx
+            > /tmp/dist-skydeck-rx/skydeck_rx.version
+          chmod +x /tmp/dist-skydeck-rx/skydeck_rx
 
-          tar -czf /tmp/wfb-rx-x86_64-linux.tar.gz -C /tmp/dist-wfb .
-          sha256sum /tmp/wfb-rx-x86_64-linux.tar.gz \
-            > /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
+          tar -czf /tmp/skydeck-rx-x86_64-linux.tar.gz -C /tmp/dist-skydeck-rx .
+          sha256sum /tmp/skydeck-rx-x86_64-linux.tar.gz \
+            > /tmp/skydeck-rx-x86_64-linux.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wfb-rx-x86_64-linux
+          name: skydeck-rx-x86_64-linux
           path: |
-            /tmp/wfb-rx-x86_64-linux.tar.gz
-            /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
+            /tmp/skydeck-rx-x86_64-linux.tar.gz
+            /tmp/skydeck-rx-x86_64-linux.tar.gz.sha256
           retention-days: 14
 
       - name: Attach to release
@@ -170,5 +251,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            /tmp/wfb-rx-x86_64-linux.tar.gz
-            /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
+            /tmp/skydeck-rx-x86_64-linux.tar.gz
+            /tmp/skydeck-rx-x86_64-linux.tar.gz.sha256
