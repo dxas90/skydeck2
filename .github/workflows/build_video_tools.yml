@@ -347,7 +347,7 @@ jobs:
               devourer
               PkgConfig::LIBUSB
               /usr/lib/x86_64-linux-gnu/libsodium.a
-              /usr/lib/x86_64-linux-gnu/libpcap.a)
+              PkgConfig::LIBPCAP)
           """).lstrip()
           pathlib.Path("/tmp/skydeck_rx_build/CMakeLists.txt").write_text(cmake)
           print("CMakeLists.txt written", len(cmake), "bytes")
@@ -371,7 +371,17 @@ jobs:
           echo "SKYDECK_RX=$BINARY" >> "$GITHUB_ENV"
           echo "Binary: $BINARY"
           file "$BINARY"
-          ldd  "$BINARY" || true
+          # Patch libpcap soname: Ubuntu builds against .so.0.8, SteamOS has .so.1
+          # Both expose the same symbols — just fix the soname string in the ELF
+          if ldd "$BINARY" 2>/dev/null | grep -q "libpcap.so.0"; then
+            patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 "$BINARY" 2>/dev/null \
+              && echo "patched libpcap soname → libpcap.so.1" \
+              || echo "patchelf not available — installing"
+            sudo apt-get install -y --no-install-recommends patchelf -qq
+            patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 "$BINARY" \
+              && echo "patched libpcap soname → libpcap.so.1"
+          fi
+          ldd "$BINARY" | grep -E "sodium|pcap|usb"
 
       - name: Package
         run: |
