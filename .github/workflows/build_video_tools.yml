@@ -126,6 +126,14 @@ jobs:
             cmake ninja-build g++ pkg-config git \
             libusb-1.0-0-dev libsodium-dev libpcap-dev
 
+      - name: Static-link sodium and pcap for portability
+        run: |
+          # Build static libsodium so the binary works on any distro version
+          sudo apt-get install -y --no-install-recommends libsodium-dev libpcap-dev
+          # Check if static libs exist (Ubuntu ships them in -dev packages)
+          ls /usr/lib/x86_64-linux-gnu/libsodium.a /usr/lib/x86_64-linux-gnu/libpcap.a 2>/dev/null \
+            && echo "Static libs available" || echo "No static libs — dynamic linking only"
+
       - name: Clone Aviateur (wifi + devourer submodules only — skip GUI)
         env:
           AVIATEUR_REF: main
@@ -347,7 +355,9 @@ jobs:
           cmake -S /tmp/skydeck_rx_build -B /tmp/skydeck_rx_cmake \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ \
+              /usr/lib/x86_64-linux-gnu/libsodium.a \
+              /usr/lib/x86_64-linux-gnu/libpcap.a" \
             -DAVIATEUR_SRC=/tmp/aviateur-src \
             -DHEADLESS_MAIN=/tmp/aviateur-src/src/headless_main.cpp
 
