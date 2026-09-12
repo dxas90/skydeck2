@@ -128,14 +128,21 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libswresample-dev
 
-      - name: Clone Aviateur (with submodules for devourer + wfb-ng)
+      - name: Clone Aviateur (wifi + devourer submodules only — skip GUI)
         env:
           AVIATEUR_REF: main
         run: |
-          git clone --depth 1 --branch "$AVIATEUR_REF" --recurse-submodules \
+          # Clone without submodules first, then init only what we need.
+          # vecgui (3rd/vecgui) and SDL (3rd/SDL) are GUI-only — skip them.
+          # The headless build needs: 3rd/devourer, 3rd/json, 3rd/mINI
+          git clone --depth 1 --branch "$AVIATEUR_REF" \
             https://github.com/OpenIPC/aviateur.git /tmp/aviateur-src
-          echo "AVIATEUR_SHA=$(git -C /tmp/aviateur-src rev-parse --short HEAD)" \
-            >> "$GITHUB_ENV"
+          cd /tmp/aviateur-src
+          git submodule update --init --depth 1 \
+            3rd/devourer \
+            3rd/json \
+            3rd/mINI
+          echo "AVIATEUR_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Write headless main (no GUI, no SDL — just devourer + wfb + UDP out)
         run: |
