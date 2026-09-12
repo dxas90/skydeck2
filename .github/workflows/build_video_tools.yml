@@ -288,14 +288,18 @@ jobs:
           add_subdirectory(${AVIATEUR_SRC}/3rd/devourer devourer_build EXCLUDE_FROM_ALL)
 
           # WFB-NG sources only (no wfbng_link.cpp — it depends on vecgui/GUI)
+          # zfex.c provides fec_t used by rx.cpp/rx.hpp
           set(WFB_SRCS
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/rx.cpp
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/wifibroadcast.cpp
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex.c
           )
 
           add_executable(skydeck_rx ${HEADLESS_MAIN} ${WFB_SRCS})
 
+          # PREINCLUDE_FILE points to zfex_pp.h — wifibroadcast.hpp uses #include PREINCLUDE_FILE
           target_compile_definitions(skydeck_rx PRIVATE
+              PREINCLUDE_FILE="${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex_pp.h"
               ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_USE_INTEL_SSSE3
               ZFEX_INLINE_ADDMUL ZFEX_INLINE_ADDMUL_SIMD)
 
