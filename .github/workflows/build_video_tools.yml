@@ -124,9 +124,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ pkg-config git \
-            libusb-1.0-0-dev libsodium-dev libpcap-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev
+            libusb-1.0-0-dev libsodium-dev libpcap-dev
 
       - name: Clone Aviateur (wifi + devourer submodules only — skip GUI)
         env:
@@ -151,41 +149,95 @@ jobs:
           src = textwrap.dedent("""
           /*
            * headless_main.cpp — SkyDeck headless WFB-NG receiver
+           * Uses devourer (RTL8812AU libusb) + Aviateur's AggregatorX (wfb-ng decrypt)
+           * Outputs decoded RTP video to udp://127.0.0.1:SKYDECK_PORT
            */
+          #include <arpa/inet.h>
+          #include <netinet/in.h>
+          #include <sys/socket.h>
           #include <csignal>
           #include <cstdio>
           #include <cstdlib>
+          #include <cstring>
           #include <atomic>
+          #include <memory>
           #include <string>
           #include <thread>
           #include <chrono>
-          #include "wifi/wfbng_link.h"
+
+          #include <libusb-1.0/libusb.h>
+          #include "WiFiDriver.h"
+          #include "RxPacket.h"
+          #include "wfb-ng/rx.hpp"
 
           static std::atomic<bool> g_stop{false};
-          static void handle_sig(int) { g_stop = true; }
-          static int env_int(const char *n, int d) { auto v=std::getenv(n); return v?std::atoi(v):d; }
-          static std::string env_str(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
+          static void on_signal(int) { g_stop = true; }
+
+          static int         ei(const char *n, int d)  { auto v=std::getenv(n); return v?std::atoi(v):d; }
+          static std::string es(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
+          static uint32_t    eu(const char *n, uint32_t d) { auto v=std::getenv(n); return v?(uint32_t)std::stoul(v):d; }
+
+          // Minimal UDP sender used as the AggregatorX output
+          class UdpOut : public UDPTransmitter {
+          public:
+              UdpOut(const std::string &addr, int port) {
+                  fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+                  memset(&sa_, 0, sizeof(sa_));
+                  sa_.sin_family      = AF_INET;
+                  sa_.sin_port        = htons(port);
+                  sa_.sin_addr.s_addr = inet_addr(addr.c_str());
+              }
+              ~UdpOut() { if(fd_>=0) ::close(fd_); }
+              void send_packet(const uint8_t *buf, size_t len) override {
+                  sendto(fd_, buf, len, 0, (sockaddr*)&sa_, sizeof(sa_));
+              }
+          private:
+              int fd_=-1;
+              sockaddr_in sa_{};
+          };
 
           int main() {
-              std::signal(SIGINT,  handle_sig);
-              std::signal(SIGTERM, handle_sig);
-              const int      channel  = env_int("SKYDECK_CHANNEL", 161);
-              const int      bw       = env_int("SKYDECK_BW",        0);
-              const int      out_port = env_int("SKYDECK_PORT",    5600);
-              std::string    key      = env_str("SKYDECK_KEY",
-                  std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/.aviateur/gs.key");
-              fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d\\n",
-                      channel, bw ? "40MHz" : "20MHz", key.c_str(), out_port);
-              auto devices = WfbngLink::get_device_list();
-              if (devices.empty()) { fprintf(stderr, "[skydeck_rx] No adapter found\\n"); return 1; }
-              fprintf(stderr, "[skydeck_rx] Using: %s\\n", devices[0].display_name.c_str());
-              WfbngLink link;
-              if (!link.start(devices[0], (uint8_t)channel, bw, key)) {
-                  fprintf(stderr, "[skydeck_rx] Start failed\\n"); return 1;
-              }
-              fprintf(stderr, "[skydeck_rx] Receiving → udp://127.0.0.1:%d\\n", out_port);
-              while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(500));
-              link.stop();
+              std::signal(SIGINT,  on_signal);
+              std::signal(SIGTERM, on_signal);
+
+              const int      ch      = ei("SKYDECK_CHANNEL", 161);
+              const int      bw      = ei("SKYDECK_BW",        0);   // 0=20MHz 1=40MHz
+              const int      port    = ei("SKYDECK_PORT",    5600);
+              const uint32_t link_id = eu("SKYDECK_LINK_ID", 7669206);
+              std::string    key     = es("SKYDECK_KEY",
+                  std::string(std::getenv("HOME")?std::getenv("HOME"):"") + "/.aviateur/gs.key");
+
+              fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d link_id=%u\\n",
+                      ch, bw?"40MHz":"20MHz", key.c_str(), port, link_id);
+
+              // WFB-NG aggregator — decrypts packets and sends decoded video to UDP
+              auto udp_out = std::make_shared<UdpOut>("127.0.0.1", port);
+              auto aggregator = std::make_unique<Aggregator>(key, link_id, udp_out);
+
+              // devourer — libusb RTL8812AU driver
+              libusb_context *ctx = nullptr;
+              if (libusb_init(&ctx)) { fputs("[skydeck_rx] libusb_init failed\\n", stderr); return 1; }
+
+              auto *handle = libusb_open_device_with_vid_pid(ctx, 0x0bda, 0x8812);
+              if (!handle) { fputs("[skydeck_rx] RTL8812AU not found\\n", stderr); libusb_exit(ctx); return 1; }
+              libusb_detach_kernel_driver(handle, 0);
+              libusb_claim_interface(handle, 0);
+
+              auto driver = devourer::WiFiDriver::CreateRadio(handle, {});
+              if (!driver) { fputs("[skydeck_rx] CreateRadio failed\\n", stderr); return 1; }
+              driver->SetChannel(ch, bw);
+
+              fprintf(stderr, "[skydeck_rx] Listening → udp://127.0.0.1:%d\\n", port);
+
+              driver->StartRxLoop([&aggregator](const devourer::Packet &pkt) {
+                  int8_t rssi[2]  = { (int8_t)pkt.rssi, (int8_t)pkt.rssi };
+                  int8_t noise[2] = { 127, 127 };
+                  aggregator->process_packet(
+                      pkt.data, pkt.length, 0, nullptr, rssi, noise, 0, 0, 0, nullptr);
+              }, g_stop);
+
+              libusb_close(handle);
+              libusb_exit(ctx);
               return 0;
           }
           """).lstrip()
@@ -207,8 +259,6 @@ jobs:
           pkg_check_modules(LIBUSB    REQUIRED IMPORTED_TARGET libusb-1.0)
           pkg_check_modules(LIBSODIUM REQUIRED IMPORTED_TARGET libsodium)
           pkg_check_modules(LIBPCAP   REQUIRED IMPORTED_TARGET libpcap)
-          pkg_check_modules(LIBAV     REQUIRED IMPORTED_TARGET
-              libavformat libavcodec libswresample libswscale libavutil)
 
           set(DEVOURER_8814          OFF CACHE BOOL "" FORCE)
           set(DEVOURER_JAGUAR2_8822B OFF CACHE BOOL "" FORCE)
@@ -221,31 +271,28 @@ jobs:
           set(DEVOURER_LOG_MAX_LEVEL WARN CACHE STRING "" FORCE)
           add_subdirectory(${AVIATEUR_SRC}/3rd/devourer devourer_build EXCLUDE_FROM_ALL)
 
-          file(GLOB WIFI_SRCS
-              ${AVIATEUR_SRC}/src/wifi/*.cpp
-              ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.c
-              ${AVIATEUR_SRC}/src/wifi/wfb-ng/*.cpp
-              ${AVIATEUR_SRC}/src/wifi/linux/*.cpp)
-          file(GLOB PLAYER_SRCS ${AVIATEUR_SRC}/src/player/*.cpp)
+          # WFB-NG sources only (no wfbng_link.cpp — it depends on vecgui/GUI)
+          set(WFB_SRCS
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/rx.cpp
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/wifibroadcast.cpp
+          )
 
-          add_executable(skydeck_rx ${HEADLESS_MAIN} ${WIFI_SRCS} ${PLAYER_SRCS})
+          add_executable(skydeck_rx ${HEADLESS_MAIN} ${WFB_SRCS})
 
           target_compile_definitions(skydeck_rx PRIVATE
               ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_USE_INTEL_SSSE3
               ZFEX_INLINE_ADDMUL ZFEX_INLINE_ADDMUL_SIMD)
 
           target_include_directories(skydeck_rx PRIVATE
-              ${AVIATEUR_SRC}/src
               ${AVIATEUR_SRC}/src/wifi
               ${AVIATEUR_SRC}/src/wifi/compat
               ${AVIATEUR_SRC}/src/wifi/wfb-ng
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/include
               ${AVIATEUR_SRC}/3rd/devourer/src
-              ${AVIATEUR_SRC}/3rd/devourer/hal
-              ${AVIATEUR_SRC}/3rd/json/include
-              ${AVIATEUR_SRC}/3rd/mINI/src)
+              ${AVIATEUR_SRC}/3rd/devourer/hal)
 
           target_link_libraries(skydeck_rx PRIVATE
-              devourer PkgConfig::LIBAV PkgConfig::LIBSODIUM PkgConfig::LIBPCAP)
+              devourer PkgConfig::LIBUSB PkgConfig::LIBSODIUM PkgConfig::LIBPCAP)
           """).lstrip()
           pathlib.Path("/tmp/skydeck_rx_build/CMakeLists.txt").write_text(cmake)
           print("CMakeLists.txt written", len(cmake), "bytes")
