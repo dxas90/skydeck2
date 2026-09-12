@@ -297,9 +297,10 @@ jobs:
 
           add_executable(skydeck_rx ${HEADLESS_MAIN} ${WFB_SRCS})
 
-          # PREINCLUDE_FILE points to zfex_pp.h — wifibroadcast.hpp uses #include PREINCLUDE_FILE
+          # PREINCLUDE_FILE points to zfex.h — wifibroadcast.hpp uses #include PREINCLUDE_FILE
+          # zfex.h defines fec_t used by rx.hpp
           target_compile_definitions(skydeck_rx PRIVATE
-              PREINCLUDE_FILE="${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex_pp.h"
+              PREINCLUDE_FILE="${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex.h"
               ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_USE_INTEL_SSSE3
               ZFEX_INLINE_ADDMUL ZFEX_INLINE_ADDMUL_SIMD)
 
