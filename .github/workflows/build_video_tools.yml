@@ -149,76 +149,64 @@ jobs:
           src = textwrap.dedent("""
           /*
            * headless_main.cpp — SkyDeck headless WFB-NG receiver
-           * devourer (RTL8812AU libusb) + Aviateur's Aggregator (wfb-ng decrypt)
-           * Outputs decoded RTP video to udp://127.0.0.1:SKYDECK_PORT
+           * devourer (RTL8812AU libusb) + wfb-ng Forwarder (UDP output)
+           * Outputs raw WFB-NG RTP to udp://127.0.0.1:SKYDECK_PORT
+           *
+           * Env vars:
+           *   SKYDECK_CHANNEL   WiFi channel (default 161)
+           *   SKYDECK_BW        0=20MHz 1=40MHz (default 0)
+           *   SKYDECK_PORT      UDP output port (default 5600)
+           *   SKYDECK_LINK_ID   WFB-NG link_id (default 7669206)
+           *   SKYDECK_KEY       gs.key path (default ~/.aviateur/gs.key)
            */
-          #include <arpa/inet.h>
-          #include <netinet/in.h>
-          #include <sys/socket.h>
           #include <csignal>
           #include <cstdio>
           #include <cstdlib>
           #include <cstring>
-          #include <atomic>
           #include <memory>
           #include <string>
-          #include <thread>
 
           #include <libusb-1.0/libusb.h>
           #include "WiFiDriver.h"
           #include "RxPacket.h"
           #include "SelectedChannel.h"
+          #include "logger.h"
           #include "wfb-ng/rx.hpp"
 
-          static std::atomic<bool>  g_stop{false};
           static std::unique_ptr<IRtlDevice> g_device;
 
           static void on_signal(int) {
-              g_stop = true;
               if (g_device) g_device->StopRxLoop();
           }
 
-          static int         ei(const char *n, int d) { auto v=std::getenv(n); return v?std::atoi(v):d; }
-          static std::string es(const char *n, const std::string &d) { auto v=std::getenv(n); return v?v:d; }
+          static int         ei(const char *n, int d)      { auto v=std::getenv(n); return v?std::atoi(v):d; }
+          static std::string es(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
           static uint32_t    eu(const char *n, uint32_t d) { auto v=std::getenv(n); return v?(uint32_t)std::stoul(v):d; }
-
-          class UdpOut : public UDPTransmitter {
-          public:
-              UdpOut(const std::string &addr, int port) {
-                  fd_ = socket(AF_INET, SOCK_DGRAM, 0);
-                  memset(&sa_, 0, sizeof(sa_));
-                  sa_.sin_family      = AF_INET;
-                  sa_.sin_port        = htons(port);
-                  sa_.sin_addr.s_addr = inet_addr(addr.c_str());
-              }
-              ~UdpOut() { if (fd_>=0) ::close(fd_); }
-              void send_packet(const uint8_t *buf, size_t len) override {
-                  sendto(fd_, buf, len, 0, (sockaddr*)&sa_, sizeof(sa_));
-              }
-          private:
-              int fd_=-1;
-              sockaddr_in sa_{};
-          };
 
           int main() {
               std::signal(SIGINT,  on_signal);
               std::signal(SIGTERM, on_signal);
 
               const int      ch_num  = ei("SKYDECK_CHANNEL", 161);
-              const int      bw      = ei("SKYDECK_BW",        0);  // 0=20MHz 1=40MHz
+              const int      bw_idx  = ei("SKYDECK_BW",        0);
               const int      port    = ei("SKYDECK_PORT",    5600);
               const uint32_t link_id = eu("SKYDECK_LINK_ID", 7669206);
               std::string    key     = es("SKYDECK_KEY",
                   std::string(std::getenv("HOME")?std::getenv("HOME"):"") + "/.aviateur/gs.key");
 
               fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d link_id=%u\\n",
-                      ch_num, bw?"40MHz":"20MHz", key.c_str(), port, link_id);
+                      ch_num, bw_idx?"40MHz":"20MHz", key.c_str(), port, link_id);
 
-              auto udp_out    = std::make_shared<UdpOut>("127.0.0.1", port);
-              auto aggregator = std::make_unique<Aggregator>(key, link_id, udp_out);
+              // Forwarder: concrete subclass of Aggregator that sends decoded video to UDP.
+              // Aggregator(keypair_path, epoch, channel_id)
+              // Forwarder(client_addr, client_port, snd_buf_size)
+              // We use Forwarder which already implements send_to_socket via UDP.
+              auto fwd = std::make_unique<Forwarder>("127.0.0.1", port, 0);
 
               libusb_context *ctx = nullptr;
-              if (libusb_init(&ctx)) { fputs("[skydeck_rx] libusb_init failed\\n", stderr); return 1; }
+              if (libusb_init(&ctx) != 0) {
+                  fputs("[skydeck_rx] libusb_init failed\\n", stderr); return 1;
+              }
 
               auto *handle = libusb_open_device_with_vid_pid(ctx, 0x0bda, 0x8812);
               if (!handle) {
@@ -228,23 +216,39 @@ jobs:
               libusb_detach_kernel_driver(handle, 0);
               libusb_claim_interface(handle, 0);
 
-              WiFiDriver drv;
+              // WiFiDriver takes an optional Logger_t; default-construct for silent logging
+              WiFiDriver drv{Logger_t{}};
               g_device = drv.CreateRtlDevice(handle, ctx);
-              if (!g_device) { fputs("[skydeck_rx] CreateRtlDevice failed\\n", stderr); return 1; }
+              if (!g_device) {
+                  fputs("[skydeck_rx] CreateRtlDevice failed\\n", stderr); return 1;
+              }
 
-              // Build SelectedChannel: channel number, width (0=20MHz, 1=40MHz), offset 0
-              SelectedChannel selected_ch{ ch_num, bw, 0 };
+              // SelectedChannel: {Channel, ChannelOffset, ChannelWidth}
+              SelectedChannel selected_ch{
+                  (uint8_t)ch_num,
+                  (uint8_t)0,
+                  bw_idx ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20
+              };
 
               fprintf(stderr, "[skydeck_rx] Listening → udp://127.0.0.1:%d\\n", port);
 
-              // Init = bring-up + blocking RX loop combined
+              // Init = bring-up + blocking RX loop.
+              // Forwarder::process_packet receives raw 802.11 frames and forwards
+              // decoded video to the UDP socket.
               g_device->Init(
-                  [&aggregator](const Packet &pkt) {
-                      int8_t rssi[2]  = { (int8_t)pkt.rssi, (int8_t)pkt.rssi };
+                  [&fwd](const Packet &pkt) {
+                      // pkt.Data is std::span<uint8_t> — the raw 802.11 frame
+                      // pkt.RxAtrib.rssi[0..3] — per-path RSSI
+                      int8_t rssi[2]  = {
+                          (int8_t)pkt.RxAtrib.rssi[0],
+                          (int8_t)pkt.RxAtrib.rssi[1]
+                      };
                       int8_t noise[2] = { 127, 127 };
-                      aggregator->process_packet(
-                          pkt.data, pkt.length, 0, nullptr,
-                          rssi, noise, 0, 0, 0, nullptr);
+                      fwd->process_packet(
+                          pkt.Data.data(), pkt.Data.size(),
+                          0, nullptr,
+                          rssi, noise,
+                          0, 0, 0, nullptr);
                   },
                   selected_ch);
 
@@ -302,7 +306,6 @@ jobs:
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/include
               ${AVIATEUR_SRC}/3rd/devourer/src
               ${AVIATEUR_SRC}/3rd/devourer/hal)
-
           target_link_libraries(skydeck_rx PRIVATE
               devourer PkgConfig::LIBUSB PkgConfig::LIBSODIUM PkgConfig::LIBPCAP)
           """).lstrip()
