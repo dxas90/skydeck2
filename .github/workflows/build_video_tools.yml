@@ -1,0 +1,174 @@
+name: Build video tools
+
+# Builds two binaries needed for the independent video pipeline (no Aviateur):
+#
+#   rxdemo   — OpenIPC/devourer  — userspace RTL8812AU driver (RF capture)
+#   wfb_rx   — svpcom/wfb-ng    — WFB-NG decryptor (raw frames → RTP UDP)
+#
+# Both are x86_64 Linux static binaries, shipped as release assets so
+# install.sh can download them to the Steam Deck without any build tools.
+#
+# Runs on every push/PR (artifact only) and on v* tags (release asset).
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. devourer rxdemo
+  # ---------------------------------------------------------------------------
+  build-devourer:
+    name: Build devourer rxdemo (x86_64 Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config libusb-1.0-0-dev git
+
+      - name: Clone devourer
+        env:
+          DEVOURER_REF: master
+        run: |
+          git clone --depth 1 --branch "$DEVOURER_REF" \
+            https://github.com/OpenIPC/devourer.git /tmp/devourer-src
+          echo "DEVOURER_SHA=$(git -C /tmp/devourer-src rev-parse --short HEAD)" \
+            >> "$GITHUB_ENV"
+
+      - name: Configure (RTL8812AU only)
+        run: |
+          cmake -S /tmp/devourer-src -B /tmp/devourer-build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DDEVOURER_8814=OFF \
+            -DDEVOURER_JAGUAR2_8822B=OFF \
+            -DDEVOURER_JAGUAR2_8821C=OFF \
+            -DDEVOURER_JAGUAR3_8822C=OFF \
+            -DDEVOURER_JAGUAR3_8822E=OFF \
+            -DDEVOURER_8733B=OFF \
+            -DDEVOURER_KESTREL_8852B=OFF \
+            -DDEVOURER_KESTREL_8852C=OFF \
+            -DDEVOURER_LOG_MAX_LEVEL=WARN
+
+      - name: Build
+        run: cmake --build /tmp/devourer-build --parallel
+
+      - name: Self-tests
+        run: ctest --test-dir /tmp/devourer-build --output-on-failure
+
+      - name: Package
+        run: |
+          RXDEMO=$(find /tmp/devourer-build -name "rxdemo" -type f | head -1)
+          echo "Binary: $RXDEMO"
+          file "$RXDEMO"
+          ldd  "$RXDEMO" || true
+
+          mkdir -p /tmp/dist-devourer
+          cp "$RXDEMO" /tmp/dist-devourer/rxdemo
+          printf 'devourer_sha=%s\nbuilt=%s\nskydeck_tag=%s\n' \
+            "$DEVOURER_SHA" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$GITHUB_REF_NAME" \
+            > /tmp/dist-devourer/devourer.version
+          chmod +x /tmp/dist-devourer/rxdemo
+
+          tar -czf /tmp/rxdemo-x86_64-linux.tar.gz -C /tmp/dist-devourer .
+          sha256sum /tmp/rxdemo-x86_64-linux.tar.gz \
+            > /tmp/rxdemo-x86_64-linux.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rxdemo-x86_64-linux
+          path: |
+            /tmp/rxdemo-x86_64-linux.tar.gz
+            /tmp/rxdemo-x86_64-linux.tar.gz.sha256
+          retention-days: 14
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /tmp/rxdemo-x86_64-linux.tar.gz
+            /tmp/rxdemo-x86_64-linux.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # 2. wfb_rx (wfb-ng)
+  #
+  # wfb_rx is the WFB-NG C binary that decrypts frames captured by rxdemo
+  # and outputs decoded RTP video to a UDP port for GStreamer/mpv.
+  # It uses the aggregator mode (-a port) which accepts raw frames over UDP
+  # — no kernel monitor interface needed when paired with devourer.
+  # ---------------------------------------------------------------------------
+  build-wfb-rx:
+    name: Build wfb_rx (x86_64 Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3-all python3-dev python3-venv \
+            libpcap-dev libsodium-dev libevent-dev \
+            build-essential pkg-config git \
+            debhelper dh-python fakeroot
+
+      - name: Clone wfb-ng
+        env:
+          WFB_REF: master
+        run: |
+          git clone --depth 1 --branch "$WFB_REF" \
+            https://github.com/svpcom/wfb-ng.git /tmp/wfb-ng-src
+          echo "WFB_SHA=$(git -C /tmp/wfb-ng-src rev-parse --short HEAD)" \
+            >> "$GITHUB_ENV"
+
+      - name: Build wfb_rx
+        run: |
+          cd /tmp/wfb-ng-src
+          # Build only the C binaries (wfb_rx, wfb_tx) — not the Python daemon
+          make wfb_rx wfb_tx -j$(nproc) 2>&1
+          file wfb_rx
+          ldd  wfb_rx || true
+
+      - name: Package
+        run: |
+          mkdir -p /tmp/dist-wfb
+          cp /tmp/wfb-ng-src/wfb_rx /tmp/dist-wfb/wfb_rx
+          printf 'wfb_ng_sha=%s\nbuilt=%s\nskydeck_tag=%s\n' \
+            "$WFB_SHA" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$GITHUB_REF_NAME" \
+            > /tmp/dist-wfb/wfb_ng.version
+          chmod +x /tmp/dist-wfb/wfb_rx
+
+          tar -czf /tmp/wfb-rx-x86_64-linux.tar.gz -C /tmp/dist-wfb .
+          sha256sum /tmp/wfb-rx-x86_64-linux.tar.gz \
+            > /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wfb-rx-x86_64-linux
+          path: |
+            /tmp/wfb-rx-x86_64-linux.tar.gz
+            /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
+          retention-days: 14
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /tmp/wfb-rx-x86_64-linux.tar.gz
+            /tmp/wfb-rx-x86_64-linux.tar.gz.sha256
