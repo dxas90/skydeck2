@@ -81,12 +81,23 @@ chmod +x install.sh deck.sh aviateur.sh
 ### 3. Launch Aviateur (FPV video)
 
 ```bash
-./aviateur.sh
+./video.sh          # auto-selects best available mode
+./aviateur.sh       # Aviateur AppImage directly
 ```
 
-Or launch it from the KDE app menu / Steam as a Non-Steam Game.
-`aviateur.sh` auto-resolves the KDE display credentials and keeps the
-Aviateur `pid_vid` config entry in sync with the current USB device number.
+`video.sh` auto-detects the best available mode:
+
+| Mode | Command | Requires |
+|------|---------|---------|
+| A (default) | `./video.sh --mode a` | `aviateur.AppImage` (downloaded by `install.sh`) |
+| B (wfb-ng) | `./video.sh --mode b` | `wfb_rx` C binary + `rtl88xxau_wfb` kernel driver |
+| C (direct UDP) | `./video.sh --mode c` | Drone reachable on network (Ethernet / wfb_tun) |
+
+Mode C also accepts RTSP directly from the drone when on Ethernet:
+```bash
+mpv rtsp://192.168.1.10:554          # H.265 direct from RunCam WiFiLink 2
+gst-launch-1.0 udpsrc port=5600 ! h265parse ! avdec_h265 ! autovideosink
+```
 
 ---
 
