@@ -249,7 +249,7 @@ jobs:
               libusb_claim_interface(handle, 0);
 
               // WiFiDriver takes an optional Logger_t; default-construct for silent logging
-              WiFiDriver drv{Logger_t{}};
+              WiFiDriver drv{std::make_shared<Logger>()};
               g_device = drv.CreateRtlDevice(handle, ctx);
               if (!g_device) {
                   fputs("[skydeck_rx] CreateRtlDevice failed\\n", stderr); return 1;
