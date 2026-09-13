@@ -1,15 +1,5 @@
 name: Build video tools
 
-# Builds two binaries needed for the independent video pipeline (no Aviateur):
-#
-#   rxdemo   — OpenIPC/devourer  — userspace RTL8812AU driver (RF capture)
-#   wfb_rx   — svpcom/wfb-ng    — WFB-NG decryptor (raw frames → RTP UDP)
-#
-# Both are x86_64 Linux static binaries, shipped as release assets so
-# install.sh can download them to the Steam Deck without any build tools.
-#
-# Runs on every push/PR (artifact only) and on v* tags (release asset).
-
 on:
   push:
     branches: ["main"]
@@ -104,13 +94,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # 2. skydeck_rx — headless WFB-NG video receiver
   #
-  # Aviateur already contains the full pipeline:
-  #   devourer (libusb RF capture) + wfb-ng aggregator (decrypt/FEC) + ffmpeg
-  # We clone Aviateur, build only its wifi+player stack (no GUI, no SDL),
-  # and add a tiny headless main that writes decoded RTP to UDP.
-  #
-  # This produces one self-contained binary that replaces both rxdemo + wfb_rx:
-  #   skydeck_rx → udp://127.0.0.1:5600 → gst-launch / mpv
+  # Uses Aviateur's devourer + wfb-ng stack (no GUI/SDL).
+  # headless_main.cpp lives in src/ in this repo — mirrors wfbng_link.cpp:
+  #   RxFrame::IsValidWfbFrame() + MatchesChannelID() filter
+  #   AggregatorUDPv4 for decrypt+FEC+UDP output
+  #   ieee80211_header (24B) + FCS (4B) stripped before process_packet
   # ---------------------------------------------------------------------------
   build-skydeck-rx:
     name: Build skydeck_rx headless (x86_64 Linux)
@@ -123,24 +111,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config git \
+            cmake ninja-build g++ pkg-config git patchelf \
             libusb-1.0-0-dev libsodium-dev libpcap-dev
 
-      - name: Static-link sodium and pcap for portability
+      - name: Check static libs
         run: |
-          # Build static libsodium so the binary works on any distro version
-          sudo apt-get install -y --no-install-recommends libsodium-dev libpcap-dev
-          # Check if static libs exist (Ubuntu ships them in -dev packages)
           ls /usr/lib/x86_64-linux-gnu/libsodium.a /usr/lib/x86_64-linux-gnu/libpcap.a 2>/dev/null \
-            && echo "Static libs available" || echo "No static libs — dynamic linking only"
+            && echo "Static libs available" || echo "No static libs — dynamic only"
 
-      - name: Clone Aviateur (wifi + devourer submodules only — skip GUI)
+      - name: Clone Aviateur (devourer submodule only — skip GUI)
         env:
           AVIATEUR_REF: main
         run: |
-          # Clone without submodules first, then init only what we need.
-          # vecgui (3rd/vecgui) and SDL (3rd/SDL) are GUI-only — skip them.
-          # The headless build needs: 3rd/devourer, 3rd/json, 3rd/mINI
           git clone --depth 1 --branch "$AVIATEUR_REF" \
             https://github.com/OpenIPC/aviateur.git /tmp/aviateur-src
           cd /tmp/aviateur-src
@@ -150,155 +132,16 @@ jobs:
             3rd/mINI
           echo "AVIATEUR_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
-      - name: Write headless main (no GUI, no SDL — just devourer + wfb + UDP out)
+      - name: Copy headless_main.cpp from repo
         run: |
-          python3 - << 'PYEOF'
-          import textwrap, pathlib
-          src = textwrap.dedent("""
-          /*
-           * headless_main.cpp — SkyDeck headless WFB-NG receiver
-           * devourer (RTL8812AU libusb) + wfb-ng Aggregator (decrypt+FEC) → UDP
-           * Outputs DECODED video RTP to udp://127.0.0.1:SKYDECK_PORT
-           * Compatible with any player:
-           *   gst-launch-1.0 udpsrc port=5600 ! h265parse ! avdec_h265 ! autovideosink
-           *   gst-launch-1.0 udpsrc port=5600 ! h264parse ! openh264dec ! autovideosink
-           *   vlc udp://@:5600
-           *
-           * Env vars:
-           *   SKYDECK_CHANNEL   WiFi channel (default 161)
-           *   SKYDECK_BW        0=20MHz 1=40MHz (default 0)
-           *   SKYDECK_PORT      UDP output port (default 5600)
-           *   SKYDECK_LINK_ID   WFB-NG link_id (default 7669206)
-           *   SKYDECK_KEY       gs.key path (default ~/.aviateur/gs.key)
-           */
-          #include <arpa/inet.h>
-          #include <csignal>
-          #include <cstdio>
-          #include <cstdlib>
-          #include <cstring>
-          #include <memory>
-          #include <string>
+          cp "$GITHUB_WORKSPACE/src/headless_main.cpp" \
+             /tmp/aviateur-src/src/headless_main.cpp
+          echo "Copied $(wc -c < /tmp/aviateur-src/src/headless_main.cpp) bytes"
 
-          #include <libusb-1.0/libusb.h>
-          #include "WiFiDriver.h"
-          #include "RxPacket.h"
-          #include "SelectedChannel.h"
-          #include "logger.h"
-          #include "wfb-ng/rx.hpp"
-
-          static std::unique_ptr<IRtlDevice> g_device;
-
-          static void on_signal(int) {
-              if (g_device) g_device->StopRxLoop();
-          }
-
-          static int         ei(const char *n, int d)      { auto v=std::getenv(n); return v?std::atoi(v):d; }
-          static std::string es(const char *n, std::string d) { auto v=std::getenv(n); return v?v:d; }
-          static uint32_t    eu(const char *n, uint32_t d) { auto v=std::getenv(n); return v?(uint32_t)std::stoul(v):d; }
-
-          int main() {
-              std::signal(SIGINT,  on_signal);
-              std::signal(SIGTERM, on_signal);
-
-              const int      ch_num  = ei("SKYDECK_CHANNEL", 161);
-              const int      bw_idx  = ei("SKYDECK_BW",        0);
-              const int      port    = ei("SKYDECK_PORT",    5600);
-              const uint32_t link_id = eu("SKYDECK_LINK_ID", 7669206);
-              std::string    key     = es("SKYDECK_KEY",
-                  std::string(std::getenv("HOME")?std::getenv("HOME"):"") + "/.aviateur/gs.key");
-
-              fprintf(stderr, "[skydeck_rx] ch=%d bw=%s key=%s port=%d link_id=%u\\n",
-                      ch_num, bw_idx?"40MHz":"20MHz", key.c_str(), port, link_id);
-
-              // VideoOut subclasses Aggregator (abstract) and implements send_to_socket.
-              // Aggregator(key, epoch, link_id) does WFB-NG decrypt+FEC, then calls
-              // send_to_socket(payload, size) with decoded video — we forward to UDP.
-              // Any player works: gst-launch, mpv, VLC.
-              class VideoOut : public Aggregator {
-              public:
-                  VideoOut(const std::string &k, uint32_t lid, const std::string &a, int p)
-                      : Aggregator(k, 0, lid) {
-                      fd_ = socket(AF_INET, SOCK_DGRAM, 0);
-                      memset(&sa_, 0, sizeof(sa_));
-                      sa_.sin_family = AF_INET;
-                      sa_.sin_port = htons(p);
-                      sa_.sin_addr.s_addr = inet_addr(a.c_str());
-                  }
-                  ~VideoOut() { if (fd_>=0) close(fd_); }
-              protected:
-                  void send_to_socket(const uint8_t *buf, uint16_t len) override {
-                      sendto(fd_, buf, len, 0, (sockaddr*)&sa_, sizeof(sa_));
-                  }
-              private:
-                  int fd_=-1;
-                  sockaddr_in sa_{};
-              };
-              auto fwd = std::make_unique<VideoOut>(key, link_id, "127.0.0.1", port);
-
-              libusb_context *ctx = nullptr;
-              if (libusb_init(&ctx) != 0) {
-                  fputs("[skydeck_rx] libusb_init failed\\n", stderr); return 1;
-              }
-
-              auto *handle = libusb_open_device_with_vid_pid(ctx, 0x0bda, 0x8812);
-              if (!handle) {
-                  fputs("[skydeck_rx] RTL8812AU (0bda:8812) not found\\n", stderr);
-                  libusb_exit(ctx); return 1;
-              }
-              libusb_detach_kernel_driver(handle, 0);
-              libusb_claim_interface(handle, 0);
-
-              // WiFiDriver takes an optional Logger_t; default-construct for silent logging
-              WiFiDriver drv{std::make_shared<Logger>()};
-              g_device = drv.CreateRtlDevice(handle, ctx);
-              if (!g_device) {
-                  fputs("[skydeck_rx] CreateRtlDevice failed\\n", stderr); return 1;
-              }
-
-              // SelectedChannel: {Channel, ChannelOffset, ChannelWidth}
-              SelectedChannel selected_ch{
-                  (uint8_t)ch_num,
-                  (uint8_t)0,
-                  bw_idx ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20
-              };
-
-              fprintf(stderr, "[skydeck_rx] Listening → udp://127.0.0.1:%d\\n", port);
-
-              // Init = bring-up + blocking RX loop.
-              // Forwarder::process_packet receives raw 802.11 frames and forwards
-              // decoded video to the UDP socket.
-              g_device->Init(
-                  [&fwd](const Packet &pkt) {
-                      // pkt.Data is std::span<uint8_t> — the raw 802.11 frame
-                      // pkt.RxAtrib.rssi[0..3] — per-path RSSI
-                      int8_t rssi[2]  = {
-                          (int8_t)pkt.RxAtrib.rssi[0],
-                          (int8_t)pkt.RxAtrib.rssi[1]
-                      };
-                      int8_t noise[2] = { 127, 127 };
-                      fwd->process_packet(
-                          pkt.Data.data(), pkt.Data.size(),
-                          0, nullptr,
-                          rssi, noise,
-                          0, 0, 0, nullptr);
-                  },
-                  selected_ch);
-
-              libusb_close(handle);
-              libusb_exit(ctx);
-              return 0;
-          }
-          """).lstrip()
-          pathlib.Path("/tmp/aviateur-src/src/headless_main.cpp").write_text(src)
-          print("headless_main.cpp written", len(src), "bytes")
-          PYEOF
-
-      - name: Write standalone CMakeLists.txt (bypass Aviateur GUI build system)
+      - name: Write CMakeLists.txt for skydeck_rx
         run: |
           mkdir -p /tmp/skydeck_rx_build
-          python3 - << 'PYEOF'
-          import textwrap, pathlib
-          cmake = textwrap.dedent("""
+          cat > /tmp/skydeck_rx_build/CMakeLists.txt << 'CMEOF'
           cmake_minimum_required(VERSION 3.18)
           project(skydeck_rx LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 20)
@@ -319,18 +162,20 @@ jobs:
           set(DEVOURER_LOG_MAX_LEVEL WARN CACHE STRING "" FORCE)
           add_subdirectory(${AVIATEUR_SRC}/3rd/devourer devourer_build EXCLUDE_FROM_ALL)
 
-          # WFB-NG sources only (no wfbng_link.cpp — it depends on vecgui/GUI)
-          # zfex.c provides fec_t used by rx.cpp/rx.hpp
+          # WFB-NG sources — explicit list, no globbing (wfbng_link.cpp pulls in GUI)
+          # zfex.c defines fec_t required by rx.hpp
           set(WFB_SRCS
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/rx.cpp
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/wifibroadcast.cpp
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex.c
           )
 
-          add_executable(skydeck_rx ${HEADLESS_MAIN} ${WFB_SRCS})
+          add_executable(skydeck_rx
+              ${AVIATEUR_SRC}/src/headless_main.cpp
+              ${WFB_SRCS}
+          )
 
-          # PREINCLUDE_FILE points to zfex.h — wifibroadcast.hpp uses #include PREINCLUDE_FILE
-          # zfex.h defines fec_t used by rx.hpp
+          # PREINCLUDE_FILE = zfex.h (defines fec_t); NOT zfex_pp.h (only macros)
           target_compile_definitions(skydeck_rx PRIVATE
               PREINCLUDE_FILE="${AVIATEUR_SRC}/src/wifi/wfb-ng/zfex.h"
               ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_USE_INTEL_SSSE3
@@ -341,17 +186,18 @@ jobs:
               ${AVIATEUR_SRC}/src/wifi/compat
               ${AVIATEUR_SRC}/src/wifi/wfb-ng
               ${AVIATEUR_SRC}/src/wifi/wfb-ng/include
+              ${AVIATEUR_SRC}/src/wifi/wfb-ng/protocol
               ${AVIATEUR_SRC}/3rd/devourer/src
               ${AVIATEUR_SRC}/3rd/devourer/hal)
+
           target_link_libraries(skydeck_rx PRIVATE
               devourer
               PkgConfig::LIBUSB
               /usr/lib/x86_64-linux-gnu/libsodium.a
               PkgConfig::LIBPCAP)
-          """).lstrip()
-          pathlib.Path("/tmp/skydeck_rx_build/CMakeLists.txt").write_text(cmake)
-          print("CMakeLists.txt written", len(cmake), "bytes")
-          PYEOF
+          CMEOF
+          echo "CMakeLists.txt written"
+          cat /tmp/skydeck_rx_build/CMakeLists.txt
 
       - name: Configure skydeck_rx
         run: |
@@ -361,25 +207,19 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ \
               /usr/lib/x86_64-linux-gnu/libsodium.a \
               /usr/lib/x86_64-linux-gnu/libpcap.a" \
-            -DAVIATEUR_SRC=/tmp/aviateur-src \
-            -DHEADLESS_MAIN=/tmp/aviateur-src/src/headless_main.cpp
+            -DAVIATEUR_SRC=/tmp/aviateur-src
 
       - name: Build skydeck_rx
         run: |
-          cmake --build /tmp/skydeck_rx_cmake --parallel 2>&1 | tail -30
+          cmake --build /tmp/skydeck_rx_cmake --parallel 2>&1 | tail -40
           BINARY=$(find /tmp/skydeck_rx_cmake -name "skydeck_rx" -type f | head -1)
           echo "SKYDECK_RX=$BINARY" >> "$GITHUB_ENV"
           echo "Binary: $BINARY"
           file "$BINARY"
-          # Patch libpcap soname: Ubuntu builds against .so.0.8, SteamOS has .so.1
-          # Both expose the same symbols — just fix the soname string in the ELF
+          # Patch libpcap soname: Ubuntu .so.0.8 → SteamOS .so.1
           if ldd "$BINARY" 2>/dev/null | grep -q "libpcap.so.0"; then
-            patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 "$BINARY" 2>/dev/null \
-              && echo "patched libpcap soname → libpcap.so.1" \
-              || echo "patchelf not available — installing"
-            sudo apt-get install -y --no-install-recommends patchelf -qq
             patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 "$BINARY" \
-              && echo "patched libpcap soname → libpcap.so.1"
+              && echo "patched libpcap soname -> libpcap.so.1"
           fi
           ldd "$BINARY" | grep -E "sodium|pcap|usb"
 
